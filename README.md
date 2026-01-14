@@ -3,7 +3,10 @@
 PlanT 2.0 is a lightweight, object-centric planning transformer for CARLA that enables controlled analysis of failure modes while achieving strong closed-loop performance on CARLA Leaderboard 2.0 benchmarks.
 <p align="center">
   <h3 align="center">
-    <a href="https://arxiv.org/abs/2511.07292">Paper</a> | <a href="https://huggingface.co/datasets/SimonGer/PlanT2_Dataset">Dataset</a> | <a href="https://huggingface.co/SimonGer/PlanT2">Model</a>
+    <a href="https://simonger.github.io/plant2/">Project Page</a> | 
+    <a href="https://arxiv.org/abs/2511.07292">Paper</a> | 
+    <a href="https://huggingface.co/datasets/SimonGer/PlanT2_Dataset">Dataset</a> | 
+    <a href="https://huggingface.co/SimonGer/PlanT2">Model</a>
   </h3>
 </p>
 
