@@ -70,7 +70,7 @@ $CARLA_ROOT/CarlaUE4.sh
 
 # Terminal 2
 python leaderboard_autopilot/leaderboard/leaderboard_evaluator_local.py \
-  --routes=/path/to/route_file.xml \
+  --routes=leaderboard/data/longest6_split/longest6_00.xml \
   --track=[SENSORS if B2D else MAP] \
   --agent=PlanT/PlanT_agent.py \
   --checkpoint=results.json \
