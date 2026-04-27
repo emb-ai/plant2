@@ -6,6 +6,7 @@ import torch.nn as nn
 from transformers import (
     AutoConfig,
     AutoModel,
+    BertConfig,
 )
 
 import timm
@@ -18,8 +19,10 @@ class HFLM(nn.Module):
         self.config_all = config_all
         self.config_net = config_net
 
-        # 0:padding, 1: vehicle, 2: pedestrian, 3: static, 4: stop_sign, 5: traffic_light, 6: emergency vehicle
-        self.object_types = 7  # 6 objects and 1 padding
+        # 0:padding, 1:vehicle, 2:pedestrian, 3:static, 4:stop_sign, 5:traffic_light, 6:emergency_vehicle,
+        # 7:speed_limit_sign, 8:min_speed_sign, 9:no_entry_sign, 10:no_stopping_sign,
+        # 11:detour_sign, 12:restricted_lane_sign, 13:only_auto_sign
+        self.object_types = 14  # 13 object types + 1 padding
         self.num_attributes = 6  # x,y,yaw,speed/id, extent x, extent y
         self.fc_attributes = 4
 
@@ -34,9 +37,13 @@ class HFLM(nn.Module):
         self.vocab_size[0] = int((1 + self.config_all.model.training.get("range_factor_front", 1))/2*self.vocab_size[0])
 
         # model
-        config = AutoConfig.from_pretrained(
-            self.config_net.hf_checkpoint
-        )  # load config from hugging face model
+        try:
+            config = AutoConfig.from_pretrained(self.config_net.hf_checkpoint)
+        except ValueError as e:
+            if "Unrecognized model" in str(e) or "model_type" in str(e):
+                config = BertConfig.from_pretrained(self.config_net.hf_checkpoint)
+            else:
+                raise
         self.n_embd = config.hidden_size
         self.model = AutoModel.from_config(config=config)
 
@@ -48,10 +55,9 @@ class HFLM(nn.Module):
         if self.input_bev:
             self.bev_encoder = timm.create_model("resnet18", pretrained=True, num_classes=512)
 
-        # token embedding
-        self.tok_emb = nn.ParameterList(
-            nn.Linear(self.num_attributes, self.n_embd)
-            for _ in range(self.object_types)
+        # token embedding (ModuleList so state_dict keys are tok_emb.0.weight, ...)
+        self.tok_emb = nn.ModuleList(
+            [nn.Linear(self.num_attributes, self.n_embd) for _ in range(self.object_types)]
         )
 
         self.wp_rep = self.config_all.model.waypoints.representation
@@ -79,6 +85,7 @@ class HFLM(nn.Module):
             num_tokens = self.wp_len
 
         self.wp_token = nn.Parameter(torch.randn(num_tokens, self.n_embd))
+        self.speed_token = nn.Parameter(torch.randn((self.n_embd, )))
 
         if self.config_net.get("use_dropout", False):
             self.drop = nn.Dropout(config_net.embd_pdrop)
@@ -120,6 +127,9 @@ class HFLM(nn.Module):
         # Speed
         if self.wp_rep == "path+2hot":
             self.speed_classifier = nn.Linear(self.n_embd, self.config_all.model.waypoints.bins_speed)  # TODO im paper schauen
+
+        # Ego speed classifier: predicts discretised ego speed for all wp_rep modes
+        self.ego_speed_classifier = nn.Linear(self.n_embd, 10)
 
         self.apply(self._init_weights)
 
@@ -204,13 +214,26 @@ class HFLM(nn.Module):
         x_batch_objs = batch["x_objs"]
         route_batch = batch["route_original"]
         speed_limit_batch = batch["speed_limit"]
-
-        # Remove type and embed
-        embedding = torch.zeros((*x_batch_objs.shape[:-1], self.n_embd), device=x_batch_objs.device)
+        # Remove type and embed.
+        # Pre-compute class ids and features once so that the mask, embedding, and
+        # feature tensor are all derived from the same shape — avoids any mismatch
+        # when x_batch_objs is a batched 3-D tensor (B, pool, 7).
+        class_ids = x_batch_objs[..., 0].long()   # (pool,) or (B, pool)
+        obj_feats = x_batch_objs[..., 1:]          # (pool, 6) or (B, pool, 6)
+        embedding = torch.zeros(*class_ids.shape, self.n_embd, device=x_batch_objs.device)
         for i in range(len(self.tok_emb)):
-            embedding[x_batch_objs[..., 0] == i] = self.tok_emb[i](x_batch_objs[x_batch_objs[..., 0] == i, 1:]) # remove first element of row bcs its class idx
+            mask = class_ids == i
+            if mask.any():
+                embedding[mask] = self.tok_emb[i](obj_feats[mask])
 
-        embedding = embedding[batch_idxs] # Restore batch shape
+        # Restore batch shape: select per-sample objects from the pool.
+        # 2-D pool  (pool, n_embd)      → embedding[batch_idxs]        gives (B, maxseq, n_embd)
+        # 3-D pool  (B, pool, n_embd)   → per-row fancy index           gives (B, maxseq, n_embd)
+        if embedding.dim() == 2:
+            embedding = embedding[batch_idxs]
+        else:
+            row = torch.arange(embedding.shape[0], device=embedding.device).unsqueeze(1)
+            embedding = embedding[row, batch_idxs]
 
         # Add axis in second dim (B x 1 x 512)
         route_tok = self.route_emb(route_batch.flatten(1))[:, None]
@@ -239,6 +262,11 @@ class HFLM(nn.Module):
         wp_tokens = self.wp_token.expand(embedding.shape[0], *self.wp_token.shape)
         embedding = torch.cat((wp_tokens, embedding), dim=1)
         remove_idxs += self.wp_token.shape[0]
+
+        # add speed token to end
+        speed_tok = self.speed_token.expand(embedding.shape[0], 1, -1)
+        embedding = torch.cat((embedding, speed_tok), dim=1)
+        remove_idxs += 1
 
         # embedding dropout
         if self.config_net.get("use_dropout", False):
@@ -275,15 +303,22 @@ class HFLM(nn.Module):
 
         else:
             if self.wp_rep != "path+2hot":
-                pred_wps = self.wp_generator(x[:, :self.wp_len, :])
+                pred_wps = self.wp_generator(x[:, :self.wp_len, :]) # this one
             if self.wp_rep != "waypoints":
-                pred_path = self.path_generator(x[:, self.wp_len:self.wp_len+self.path_len, :])
+                pred_path = self.path_generator(x[:, self.wp_len:self.wp_len+self.path_len, :]) # this one
+
+            # pred_speed = self.speed_classifier(x[:, 0:, :])
 
         if self.wp_rep == "path+2hot":
             if self.wp_gen == "singlegru":
                 pred_speed = self.speed_classifier(x[:, 0, :])
             else:
                 pred_speed = self.speed_classifier(x[:, self.path_len, :])
+
+        # For modes where speed is not predicted by the route classifier, use the
+        # dedicated ego speed head (always anchored on the first wp token).
+        if pred_speed is None:
+            pred_speed = self.ego_speed_classifier(x[:, -1, :])
 
         pred_plan = (pred_path, pred_wps, pred_speed)
 

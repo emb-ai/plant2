@@ -817,6 +817,8 @@ class GlobalConfig:
     self.plant_precision_brake = 2  # 2: true, false
     self.plant_object_types = 6  # vehicle, pedestrian, traffic light, stop sign, route, other
     self.plant_num_attributes = 7  # x,y, extent x, extent y,yaw,speed, brake, (class)
+    # If set (list of int), head output sizes; else derived from plant_precision_* as 2^precision
+    self.plant_vocab_size = None
     # Options: prajjwal1/bert-tiny, prajjwal1/bert-mini, prajjwal1/bert-small, prajjwal1/bert-medium
     self.plant_hf_checkpoint = 'prajjwal1/bert-medium'
     self.plant_embd_pdrop = 0.1
