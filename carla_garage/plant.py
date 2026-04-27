@@ -19,6 +19,7 @@ from nav_planner import LateralPIDController, get_throttle
 from transformers import (
     AutoConfig,
     AutoModel,
+    BertConfig,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,19 +35,28 @@ class PlanT(nn.Module):
     self.config = config
     self.lateral_pid_controller = LateralPIDController(self.config)
 
-    precisions = [
-        self.config.plant_precision_pos, self.config.plant_precision_pos, self.config.plant_precision_pos,
-        self.config.plant_precision_pos, self.config.plant_precision_angle, self.config.plant_precision_speed,
-        self.config.plant_precision_brake
-    ]
+    vocab_override = getattr(self.config, 'plant_vocab_size', None)
+    if vocab_override is not None:
+      self.vocab_size = list(vocab_override)
+    else:
+      precisions = [
+          self.config.plant_precision_pos, self.config.plant_precision_pos, self.config.plant_precision_pos,
+          self.config.plant_precision_pos, self.config.plant_precision_angle, self.config.plant_precision_speed,
+          self.config.plant_precision_brake
+      ]
+      self.vocab_size = [2**i for i in precisions]
 
     trans_out_features = 512
     if self.config.use_velocity:
       trans_out_features = 512 + 128
 
-    self.vocab_size = [2**i for i in precisions]
-
-    auto_config = AutoConfig.from_pretrained(self.config.plant_hf_checkpoint)
+    try:
+      auto_config = AutoConfig.from_pretrained(self.config.plant_hf_checkpoint)
+    except ValueError as e:
+      if "Unrecognized model" in str(e) or "model_type" in str(e):
+        auto_config = BertConfig.from_pretrained(self.config.plant_hf_checkpoint)
+      else:
+        raise
     n_embd = auto_config.hidden_size
     self.model = AutoModel.from_config(config=auto_config)
 
