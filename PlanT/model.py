@@ -11,6 +11,8 @@ from transformers import (
 
 import timm
 
+from util.sign_id import NUM_SIGN_CLASSES
+
 logger = logging.getLogger(__name__)
 
 class HFLM(nn.Module):
@@ -93,6 +95,8 @@ class HFLM(nn.Module):
         self.route_emb = nn.Linear(20*2, self.n_embd)
 
         self.speed_emb = nn.Embedding(4, self.n_embd)
+        # Explicit PDD sign-type token (route-resolved at load time). Index 0 = unknown.
+        self.sign_emb = nn.Embedding(NUM_SIGN_CLASSES, self.n_embd)
 
         self.input_ego_speed = self.config_all.model.training.get("input_ego_speed", False)
         if self.input_ego_speed:
@@ -129,7 +133,9 @@ class HFLM(nn.Module):
             self.speed_classifier = nn.Linear(self.n_embd, self.config_all.model.waypoints.bins_speed)  # TODO im paper schauen
 
         # Ego speed classifier: predicts discretised ego speed for all wp_rep modes
-        self.ego_speed_classifier = nn.Linear(self.n_embd, 10)
+        self.ego_speed_classifier = nn.Linear(
+            self.n_embd, self.config_all.model.waypoints.bins_speed
+        )
 
         self.apply(self._init_weights)
 
@@ -245,6 +251,13 @@ class HFLM(nn.Module):
 
         # How many tokens at the front before objects
         remove_idxs = 2
+
+        # Explicit sign-class token (optional for backward compat with old eval batches)
+        if "sign_id" in batch and batch["sign_id"] is not None:
+            sign_ids = batch["sign_id"].long()
+            sign_tok = self.sign_emb(sign_ids)[:, None]
+            embedding = torch.cat((sign_tok, embedding), dim=1)
+            remove_idxs += 1
 
         # Add ego_speed:
         if self.input_ego_speed:

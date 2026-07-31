@@ -1,10 +1,11 @@
 import logging
+import math
 
 import pytorch_lightning as pl
 import torch
 from torch.nn import functional as F
 from torch import nn
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import LambdaLR, MultiStepLR
 from torchmetrics import Accuracy
 
 from model import HFLM
@@ -12,6 +13,16 @@ from model import HFLM
 from plant_variables import PlanTVariables
 
 logger = logging.getLogger(__name__)
+
+
+def _cosine_warmup_lambda(current_step: int, num_warmup_steps: int, num_training_steps: int):
+    if current_step < num_warmup_steps:
+        return float(current_step) / float(max(1, num_warmup_steps))
+    progress = float(current_step - num_warmup_steps) / float(
+        max(1, num_training_steps - num_warmup_steps)
+    )
+    return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
 
 class LitHFLM(pl.LightningModule):
     def __init__(self, cfg):
@@ -42,6 +53,30 @@ class LitHFLM(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = self.model.configure_optimizers(self.cfg.model.training)
+        sched_name = str(self.cfg.get("lr_scheduler", "multistep")).lower()
+        if sched_name == "cosine_warmup":
+            total_steps = int(self.cfg.get("total_training_steps", 0) or 0)
+            warmup_steps = int(self.cfg.get("warmup_steps", 0) or 0)
+            if total_steps <= 0:
+                raise ValueError(
+                    "lr_scheduler=cosine_warmup requires cfg.total_training_steps > 0"
+                )
+            warmup_steps = max(1, min(warmup_steps, total_steps - 1))
+            scheduler = LambdaLR(
+                optimizer,
+                lr_lambda=lambda step: _cosine_warmup_lambda(
+                    step, warmup_steps, total_steps
+                ),
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
+
         scheduler = MultiStepLR(
             optimizer,
             milestones=[self.cfg.lrDecay_epoch, self.cfg.lrDecay_epoch + 10],
@@ -73,12 +108,21 @@ class LitHFLM(pl.LightningModule):
             brake = torch.zeros_like(targetspeed_batch, dtype=torch.bool, device=targetspeed_batch.device)
             twohot_targs = self.get_two_hot_encoding(targetspeed_batch, target_speeds, brake)
 
-            losses["loss_egospeed"] = self.criterion_speed(pred_speed, twohot_targs)
+            # Soft two-hot targets: CE with class probabilities (float N×C).
+            # Manual form is robust across torch builds that reject multi-dim CE targets.
+            losses["loss_egospeed"] = -(
+                twohot_targs * F.log_softmax(pred_speed, dim=-1)
+            ).sum(dim=-1).mean()
 
-        losses_forecast = [
-            torch.mean(self.criterion_forecast(logits[i], targets[i].squeeze()))
-            for i in range(len(logits))
-        ]
+        losses_forecast = []
+        for i in range(len(logits)):
+            t = targets[i].squeeze()
+            if (t != -999).any():
+                losses_forecast.append(
+                    torch.mean(self.criterion_forecast(logits[i], t))
+                )
+            else:
+                losses_forecast.append(logits[i].new_zeros(()))
         losses["loss_forecast"] = torch.mean(torch.stack(losses_forecast))
 
         for name, loss in losses.items():
@@ -143,7 +187,72 @@ class LitHFLM(pl.LightningModule):
         return loss_all
 
     def validation_step(self, batch, batch_idx):
-        pass
+        # Same losses as training_step, logged under val/*.
+        waypoints_batch = batch["waypoints"]
+        path_batch = batch["route"]
+        path_batch = path_batch[..., : self.cfg.model.waypoints.path_len, :]
+        targetspeed_batch = batch["target_speed"]
+
+        logits, targets, pred_plan, _ = self(batch)
+        (pred_path, pred_wps, pred_speed) = pred_plan
+        losses = {}
+        if pred_wps is not None:
+            losses["loss_wp"] = F.l1_loss(pred_wps, waypoints_batch)
+        if pred_path is not None:
+            losses["loss_path"] = F.l1_loss(pred_path, path_batch)
+        if pred_speed is not None:
+            target_speeds = torch.tensor(
+                self.plant_variables.target_speeds, device=targetspeed_batch.device
+            )
+            brake = torch.zeros_like(
+                targetspeed_batch, dtype=torch.bool, device=targetspeed_batch.device
+            )
+            twohot_targs = self.get_two_hot_encoding(
+                targetspeed_batch, target_speeds, brake
+            )
+            losses["loss_egospeed"] = -(
+                twohot_targs * F.log_softmax(pred_speed, dim=-1)
+            ).sum(dim=-1).mean()
+
+        losses_forecast = []
+        for i in range(len(logits)):
+            t = targets[i].squeeze()
+            if (t != -999).any():
+                losses_forecast.append(
+                    torch.mean(self.criterion_forecast(logits[i], t))
+                )
+            else:
+                losses_forecast.append(logits[i].new_zeros(()))
+        losses["loss_forecast"] = torch.mean(torch.stack(losses_forecast))
+
+        weights = {
+            "loss_wp": self.cfg.model.waypoints.get("wp_weight", 1),
+            "loss_forecast": self.cfg.model.pre_training.get("forecastLoss_weight", 0),
+            "loss_path": self.cfg.model.waypoints.get("path_weight", 1),
+            "loss_egospeed": self.cfg.model.waypoints.get("speed_weight", 1),
+        }
+        loss_all = sum(loss * weights[name] for name, loss in losses.items())
+
+        for name, loss in losses.items():
+            self.log(
+                f"val/{name}",
+                loss,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=True,
+                sync_dist=self.cfg.gpus > 1,
+                batch_size=self.cfg.model.training.batch_size,
+            )
+        self.log(
+            "val/loss_all",
+            loss_all,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=self.cfg.gpus > 1,
+            batch_size=self.cfg.model.training.batch_size,
+        )
+        return loss_all
 
     def on_after_backward(self):
         torch.nn.utils.clip_grad_norm_(

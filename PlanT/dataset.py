@@ -15,6 +15,12 @@ import glob
 
 from plant_variables import PlanTVariables
 from util.static_extents import CAR_EXTENTS, STATIC_EXTENTS
+from util.sign_id import (
+    load_split_meta_route2sign,
+    load_uid2sign,
+    resolve_sign_id_for_route,
+    route_name_from_label_path,
+)
 
 from scipy.spatial import cKDTree
 
@@ -170,6 +176,34 @@ class PlanTDataset(Dataset):
         self.labels       = np.array(self.labels      ).astype(np.bytes_)
         self.measurements = np.array(self.measurements).astype(np.bytes_)
 
+        # Route → PDD sign_id (embedding index). Resolved once at init; attached
+        # on every __getitem__ without writing into diskcache.
+        split_meta = Path(root).resolve().parent.parent / "split_meta.json"
+        if not split_meta.is_file():
+            # root is .../train/data → parent.parent is split root
+            split_meta = Path(root).resolve().parent / "split_meta.json"
+        extra_map = load_split_meta_route2sign(split_meta)
+        uid2sign = load_uid2sign()
+        # merge uid map into extra for resolve_sign_id_for_route
+        for uid, sign in uid2sign.items():
+            extra_map.setdefault(uid, sign)
+            for var in ("default", "s1", "s2", "s3", "s4"):
+                extra_map.setdefault(f"{uid}_{var}", sign)
+
+        sign_ids = []
+        n_known = 0
+        for lab in self.labels:
+            route_name = route_name_from_label_path(lab[0].decode())
+            sid = resolve_sign_id_for_route(route_name, extra_map)
+            if sid > 0:
+                n_known += 1
+            sign_ids.append(sid)
+        self.sample_sign_ids = np.asarray(sign_ids, dtype=np.int64)
+        print(
+            f"sign_id resolve: {n_known}/{len(sign_ids)} samples mapped "
+            f"(split_meta={split_meta.is_file()})"
+        )
+
         print(f"Loading {len(self.labels)} samples")
         print('Total amount of routes:', total_routes)
         print('Skipped routes:', skipped_routes)
@@ -179,6 +213,11 @@ class PlanTDataset(Dataset):
         """Returns the length of the dataset."""
         return len(self.measurements)
 
+    def _attach_sign_id(self, sample, index: int):
+        """Shallow-copy and set sign_id without mutating diskcache entries."""
+        out = dict(sample)
+        out["sign_id"] = int(self.sample_sign_ids[index])
+        return out
 
     def add_parked_cars(self, sample):
         if self.cfg_train.augment_parked:
@@ -212,20 +251,20 @@ class PlanTDataset(Dataset):
         if augment and self.data_cache is not None:
             if labels[0].decode()+"_aug" in self.data_cache:
                 sample = self.data_cache[labels[0].decode()+"_aug"]
-                return sample
+                return self._attach_sign_id(sample, index)
 
             elif labels[0].decode() in self.data_cache:
                 sample = self.transform(self.data_cache[labels[0].decode()])
                 sample.pop("BEV_aug", None)
                 sample.pop("output_floating", None)
                 self.data_cache[labels[0].decode()+"_aug"] = sample
-                return sample
+                return self._attach_sign_id(sample, index)
 
         elif self.data_cache is not None and labels[0].decode() in self.data_cache:
                 sample = self.data_cache[labels[0].decode()]
                 sample.pop("BEV_aug", None)
                 sample.pop("output_floating", None)
-                return sample
+                return self._attach_sign_id(sample, index)
 
         # Load new sample
         loaded_labels = []
@@ -252,7 +291,11 @@ class PlanTDataset(Dataset):
         sample["ego_speed"] = loaded_measurements[self.cfg_train.seq_len - 1]["speed"]
 
         speed_limit = loaded_measurements[self.cfg_train.seq_len - 1]["speed_limit"]
-        speed_limit = round(speed_limit*3.6) # TODO
+        speed_limit = round(speed_limit * 3.6)  # TODO
+        # Map unknown PDD limits (20/40/60/...) to nearest known embedding bin.
+        if speed_limit not in self.speed_cats:
+            known = sorted(self.speed_cats.keys())
+            speed_limit = min(known, key=lambda k: abs(k - speed_limit))
         sample["speed_limit"] = self.speed_cats[speed_limit]
 
         if loaded_measurements[self.cfg_train.seq_len - 1]["brake"]: # Just in case
@@ -433,9 +476,7 @@ class PlanTDataset(Dataset):
         sample.pop("BEV_aug", None)
         sample.pop("output_floating", None)
 
-        return sample
-    
-    def aug_sample(self, sample):
+        return self._attach_sign_id(sample, index)
         # In transfuser, translation gets subtracted and applied first
         translate = - np.array([0.0, sample["augmentation_translation"]])
         # In transfuser multiplizieren die R von links und transposen beides?
@@ -613,7 +654,7 @@ def generate_batch(data_batch):
         y_batch_objs.extend(sample["output"])
 
         for key in keys:
-            if key == "speed_limit":
+            if key == "speed_limit" or key == "sign_id":
                 batches[key].append(torch.tensor(sample[key], dtype=torch.int))
             else:
                 if torch.is_tensor(sample[key]):

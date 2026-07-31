@@ -29,9 +29,9 @@ _script_dir = os.path.dirname(os.path.abspath(__file__))
 if _script_dir not in sys.path:
     sys.path.insert(0, _script_dir)
 
-# Speed bin centres (m/s) — must match the bins used when training ego_speed_classifier
+# Speed bin centres (m/s) — must match PlanTVariables.target_speeds / bins_speed=8
 SPEED_BINS = np.array(
-    [0.0, 0.025, 0.05472609, 1.0, 1.5, 2.0, 4.0, 8.0, 10.0, 20.0],
+    [0.0, 4.0, 8.0, 10.0, 13.88888888, 16.0, 17.77777777, 20.0],
     dtype=np.float32,
 )
 
