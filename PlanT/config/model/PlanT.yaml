@@ -33,6 +33,14 @@ training:
   seq_len: 1
   augment: True
   augment_parked: True
+  # Multiply ego-speed CE for samples with target_speed < 0.5 m/s (stops).
+  # Override via +model.training.stop_speed_loss_weight=10 or env STOP_SPEED_LOSS_WEIGHT.
+  stop_speed_loss_weight: 1.0
+  # Per-bin weights for soft two-hot ego-speed CE (length = bins_speed / target_speeds).
+  # null = uniform. Example stop-heavy: [15,1,1,1,1,1,1,1]
+  # Override via model.training.speed_class_weights=[15,1,1,1,1,1,1,1]
+  # or env SPEED_CLASS_WEIGHTS=15,1,1,1,1,1,1,1
+  speed_class_weights: null
 
 pre_training:
   forecastLoss_weight: 1

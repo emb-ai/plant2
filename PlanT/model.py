@@ -11,6 +11,9 @@ from transformers import (
 
 import timm
 
+from plant_variables import PlanTVariables
+from util.sign_id import NUM_SIGN_CLASSES, SIGN_CODES
+
 logger = logging.getLogger(__name__)
 
 class HFLM(nn.Module):
@@ -19,12 +22,18 @@ class HFLM(nn.Module):
         self.config_all = config_all
         self.config_net = config_net
 
-        # 0:padding, 1:vehicle, 2:pedestrian, 3:static, 4:stop_sign, 5:traffic_light, 6:emergency_vehicle,
-        # 7:speed_limit_sign, 8:min_speed_sign, 9:no_entry_sign, 10:no_stopping_sign,
-        # 11:detour_sign, 12:restricted_lane_sign, 13:only_auto_sign
-        self.object_types = 14  # 13 object types + 1 padding
+        # Object class id → dedicated Linear tok_emb[i] (NOT nn.Embedding).
+        # 0:padding, 1:car, 2:walker, 3:static, 4:stop_sign, 5:traffic_light, 6:emergency,
+        # 7..: one index per PDD code in SIGN_CODES (see PlanTVariables.class_nums).
+        self.object_types = PlanTVariables.num_object_types()
         self.num_attributes = 6  # x,y,yaw,speed/id, extent x, extent y
         self.fc_attributes = 4
+        logger.info(
+            "tok_emb object_types=%d (PDD codes=%d: %s)",
+            self.object_types,
+            len(SIGN_CODES),
+            ",".join(SIGN_CODES),
+        )
 
         precisions = [
             self.config_all.model.pre_training.get("precision_pos", 4),
@@ -93,6 +102,8 @@ class HFLM(nn.Module):
         self.route_emb = nn.Linear(20*2, self.n_embd)
 
         self.speed_emb = nn.Embedding(4, self.n_embd)
+        # Explicit PDD sign-type token (route-resolved at load time). Index 0 = unknown.
+        self.sign_emb = nn.Embedding(NUM_SIGN_CLASSES, self.n_embd)
 
         self.input_ego_speed = self.config_all.model.training.get("input_ego_speed", False)
         if self.input_ego_speed:
@@ -104,7 +115,7 @@ class HFLM(nn.Module):
                 nn.Linear(self.n_embd, n_out)
                 for n_out in self.vocab_size
             ]
-        )
+        )все
 
         # Waypoints
         if self.wp_rep != "path+2hot":
@@ -129,7 +140,9 @@ class HFLM(nn.Module):
             self.speed_classifier = nn.Linear(self.n_embd, self.config_all.model.waypoints.bins_speed)  # TODO im paper schauen
 
         # Ego speed classifier: predicts discretised ego speed for all wp_rep modes
-        self.ego_speed_classifier = nn.Linear(self.n_embd, 10)
+        self.ego_speed_classifier = nn.Linear(
+            self.n_embd, self.config_all.model.waypoints.bins_speed
+        )
 
         self.apply(self._init_weights)
 
@@ -245,6 +258,13 @@ class HFLM(nn.Module):
 
         # How many tokens at the front before objects
         remove_idxs = 2
+
+        # Explicit sign-class token (optional for backward compat with old eval batches)
+        if "sign_id" in batch and batch["sign_id"] is not None:
+            sign_ids = batch["sign_id"].long()
+            sign_tok = self.sign_emb(sign_ids)[:, None]
+            embedding = torch.cat((sign_tok, embedding), dim=1)
+            remove_idxs += 1
 
         # Add ego_speed:
         if self.input_ego_speed:

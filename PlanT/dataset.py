@@ -15,6 +15,13 @@ import glob
 
 from plant_variables import PlanTVariables
 from util.static_extents import CAR_EXTENTS, STATIC_EXTENTS
+from util.sign_id import (
+    SIGN_CODES,
+    load_split_meta_route2sign,
+    load_uid2sign,
+    resolve_sign_id_for_route,
+    route_name_from_label_path,
+)
 
 from scipy.spatial import cKDTree
 
@@ -76,16 +83,22 @@ class PlanTDataset(Dataset):
         self.labels = []
         self.measurements = []
 
-        # If you're not using a slurm cluster you can use this line instead of the one after
-        label_raw_path_all = glob.glob(os.path.join(root, "**/boxes"), recursive=True)
-        # NOTE: FOR SLURM CHANGE TO:
-        # label_raw_path_all = subprocess.run(["lfs", "find", root, "-type", "d", "-name", "boxes", "--maxdepth", "3"], capture_output=True, text=True, check=True).stdout.splitlines()
+        # Fast route list when split is pre-filtered (avoids recursive NFS glob).
+        if not self.cfg_train.get("filter_routes", True):
+            root_path = Path(root)
+            label_raw_path = [
+                str(p)
+                for p in root_path.iterdir()
+                if p.is_dir() and (p / "boxes").is_dir()
+            ]
+        else:
+            # If you're not using a slurm cluster you can use this line instead of the one after
+            label_raw_path_all = glob.glob(os.path.join(root, "**/boxes"), recursive=True)
+            # NOTE: FOR SLURM CHANGE TO:
+            # label_raw_path_all = subprocess.run(["lfs", "find", root, "-type", "d", "-name", "boxes", "--maxdepth", "3"], capture_output=True, text=True, check=True).stdout.splitlines()
+            label_raw_path = [p[:-5] for p in label_raw_path_all]  # strip "/boxes"
 
-        label_raw_path_all = [p[:-5] for p in label_raw_path_all]
-
-        label_raw_path = label_raw_path_all # Could filter here if needed
-
-        logging.info(f"Found {len(label_raw_path)} results jsons.")
+        logging.info(f"Found {len(label_raw_path)} route dirs.")
 
         total_routes = 0
         skipped_routes = 0
@@ -170,6 +183,34 @@ class PlanTDataset(Dataset):
         self.labels       = np.array(self.labels      ).astype(np.bytes_)
         self.measurements = np.array(self.measurements).astype(np.bytes_)
 
+        # Route → PDD sign_id (embedding index). Resolved once at init; attached
+        # on every __getitem__ without writing into diskcache.
+        split_meta = Path(root).resolve().parent.parent / "split_meta.json"
+        if not split_meta.is_file():
+            # root is .../train/data → parent.parent is split root
+            split_meta = Path(root).resolve().parent / "split_meta.json"
+        extra_map = load_split_meta_route2sign(split_meta)
+        uid2sign = load_uid2sign()
+        # merge uid map into extra for resolve_sign_id_for_route
+        for uid, sign in uid2sign.items():
+            extra_map.setdefault(uid, sign)
+            for var in ("default", "s1", "s2", "s3", "s4"):
+                extra_map.setdefault(f"{uid}_{var}", sign)
+
+        sign_ids = []
+        n_known = 0
+        for lab in self.labels:
+            route_name = route_name_from_label_path(lab[0].decode())
+            sid = resolve_sign_id_for_route(route_name, extra_map)
+            if sid > 0:
+                n_known += 1
+            sign_ids.append(sid)
+        self.sample_sign_ids = np.asarray(sign_ids, dtype=np.int64)
+        print(
+            f"sign_id resolve: {n_known}/{len(sign_ids)} samples mapped "
+            f"(split_meta={split_meta.is_file()})"
+        )
+
         print(f"Loading {len(self.labels)} samples")
         print('Total amount of routes:', total_routes)
         print('Skipped routes:', skipped_routes)
@@ -179,6 +220,11 @@ class PlanTDataset(Dataset):
         """Returns the length of the dataset."""
         return len(self.measurements)
 
+    def _attach_sign_id(self, sample, index: int):
+        """Shallow-copy and set sign_id without mutating diskcache entries."""
+        out = dict(sample)
+        out["sign_id"] = int(self.sample_sign_ids[index])
+        return out
 
     def add_parked_cars(self, sample):
         if self.cfg_train.augment_parked:
@@ -212,20 +258,20 @@ class PlanTDataset(Dataset):
         if augment and self.data_cache is not None:
             if labels[0].decode()+"_aug" in self.data_cache:
                 sample = self.data_cache[labels[0].decode()+"_aug"]
-                return sample
+                return self._attach_sign_id(sample, index)
 
             elif labels[0].decode() in self.data_cache:
                 sample = self.transform(self.data_cache[labels[0].decode()])
                 sample.pop("BEV_aug", None)
                 sample.pop("output_floating", None)
                 self.data_cache[labels[0].decode()+"_aug"] = sample
-                return sample
+                return self._attach_sign_id(sample, index)
 
         elif self.data_cache is not None and labels[0].decode() in self.data_cache:
                 sample = self.data_cache[labels[0].decode()]
                 sample.pop("BEV_aug", None)
                 sample.pop("output_floating", None)
-                return sample
+                return self._attach_sign_id(sample, index)
 
         # Load new sample
         loaded_labels = []
@@ -248,11 +294,17 @@ class PlanTDataset(Dataset):
         sample["route_original"] = loaded_measurements[self.cfg_train.seq_len - 1]["route_original"][:20]
         sample["route"] = interpolate_route(loaded_measurements[self.cfg_train.seq_len - 1]["route"][:20])
 
-        sample["target_speed"] = loaded_measurements[self.cfg_train.seq_len - 1]["target_speed"]
-        sample["ego_speed"] = loaded_measurements[self.cfg_train.seq_len - 1]["speed"]
+        meas_t = loaded_measurements[self.cfg_train.seq_len - 1]
+        sample["target_speed"] = meas_t["target_speed"]
+        # Prefer explicit dump field; fall back to legacy ``speed``.
+        sample["ego_speed"] = meas_t["ego_speed"] if "ego_speed" in meas_t else meas_t["speed"]
 
         speed_limit = loaded_measurements[self.cfg_train.seq_len - 1]["speed_limit"]
-        speed_limit = round(speed_limit*3.6) # TODO
+        speed_limit = round(speed_limit * 3.6)  # TODO
+        # Map unknown PDD limits (20/40/60/...) to nearest known embedding bin.
+        if speed_limit not in self.speed_cats:
+            known = sorted(self.speed_cats.keys())
+            speed_limit = min(known, key=lambda k: abs(k - speed_limit))
         sample["speed_limit"] = self.speed_cats[speed_limit]
 
         if loaded_measurements[self.cfg_train.seq_len - 1]["brake"]: # Just in case
@@ -287,13 +339,17 @@ class PlanTDataset(Dataset):
         sample["ego_pos"] = measurements_data["pos_global"]
         sample["ego_rot"] = ego_yaw
 
+        # Spatial PDD signs dumped as boxes["class"] == "2.1" / "3.24" / ...
+        pdd_classes = set(SIGN_CODES)
+        sign_like = {"stop_sign"} | pdd_classes
+
         # Fix static extents and drop irrelevant objects
         for x in labels_data:
             if "position" in x:
                 pos_x, pos_y, pos_z = x["position"]
 
-                # 30m radius for tl and stop
-                if x["class"] in ["traffic_light", "stop_sign"]:
+                # 30m radius for TL / stop / PDD sign objects
+                if x["class"] in (["traffic_light"] + list(sign_like)):
                     if pos_x**2 + pos_y**2 > 30**2 or abs(pos_z) > 30:
                         x["class"] = "too far"
                 # ellipse for others
@@ -345,19 +401,33 @@ class PlanTDataset(Dataset):
                 if x["class"].lower() in self.car_types
             ]
 
-        # Add static cars, static objects, traffic lights, stop signs
+        # Add static cars, static objects, traffic lights, stop / PDD signs
+        def _keep_staticish(x) -> bool:
+            cls = x["class"].lower() if isinstance(x["class"], str) else x["class"]
+            # PDD codes are numeric strings ("2.1"); keep original key for type_nums.
+            cls_key = x["class"] if x["class"] in self.type_nums else cls
+            if cls_key in self.car_types:
+                return False
+            if cls_key not in self.type_nums:
+                return False
+            if cls == "traffic_light":
+                return x.get("state") in ["Red", "Yellow"] and x.get("affects_ego")
+            if cls_key in sign_like or cls in sign_like:
+                return bool(x.get("affects_ego"))
+            return True
+
         input_objects += [[
-                self.type_nums[x["class"].lower()], # type indicator
+                self.type_nums[x["class"] if x["class"] in self.type_nums else x["class"].lower()],
                 x["position"][0],
                 x["position"][1],
                 rad2deg(x["yaw"]),  # in degrees
                 0.0,
                 x["extent"][1]*2,
                 x["extent"][0]*2,
-                -1 if x["class"].lower() != "static_car" else -999, #-1 is for all the static objects, -999 denotes static cars, which dont have an id
+                -1 if (x["class"] if x["class"] in self.type_nums else x["class"].lower()) != "static_car" else -999,
             ]
             for x in labels_data
-            if x["class"].lower() not in self.car_types and x["class"].lower() in self.type_nums.keys() and (x["class"].lower()!="traffic_light" or (x["state"] in ["Red", "Yellow"] and x["affects_ego"])) and (x["class"]!="stop_sign" or x["affects_ego"])
+            if _keep_staticish(x)
         ]
 
         # Load output (forecasting) objects
@@ -433,12 +503,12 @@ class PlanTDataset(Dataset):
         sample.pop("BEV_aug", None)
         sample.pop("output_floating", None)
 
-        return sample
-    
+        return self._attach_sign_id(sample, index)
+
     def aug_sample(self, sample):
-        # In transfuser, translation gets subtracted and applied first
+        # Geometric augment using recorded augmentation_translation / rotation.
+        # Translation applied first (transfuser convention).
         translate = - np.array([0.0, sample["augmentation_translation"]])
-        # In transfuser multiplizieren die R von links und transposen beides?
         rot = np.deg2rad(sample["augmentation_rotation"])
 
         if self.cfg_train.get("input_bev", False):
@@ -613,7 +683,7 @@ def generate_batch(data_batch):
         y_batch_objs.extend(sample["output"])
 
         for key in keys:
-            if key == "speed_limit":
+            if key == "speed_limit" or key == "sign_id":
                 batches[key].append(torch.tensor(sample[key], dtype=torch.int))
             else:
                 if torch.is_tensor(sample[key]):
