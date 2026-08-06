@@ -115,7 +115,7 @@ class HFLM(nn.Module):
                 nn.Linear(self.n_embd, n_out)
                 for n_out in self.vocab_size
             ]
-        )все
+        )
 
         # Waypoints
         if self.wp_rep != "path+2hot":
