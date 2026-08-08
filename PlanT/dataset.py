@@ -46,6 +46,17 @@ class PlanTDataset(Dataset):
 
         self.data_cache = shared_dict
 
+        # Frames are dumped at the MetaDrive decision rate (0.1 s), while the
+        # pretrained PlanT and both controllers assume 0.25 s between waypoints
+        # (the *4.0 in PlanT_agent / plant2_control is 1/dt). Sampling every
+        # `wps_stride`-th frame restores that horizon without a re-dump.
+        # 1 = old behaviour (0.8 s of waypoints), 2 = 1.6 s, 3 = 2.4 s.
+        self.wps_stride = int(os.environ.get(
+            "WPS_STRIDE", self.cfg_train.get("wps_stride", 1)) or 1)
+        if self.wps_stride > 1:
+            print(f"[PlanTDataset] waypoint frame stride = {self.wps_stride} "
+                  f"({0.1 * self.wps_stride:.1f} s between waypoints)")
+
         self.MAX_DISTANCE = self.cfg_train.range
         self.MAX_DISTANCE_DOUBLE = 2*self.MAX_DISTANCE
 
@@ -157,13 +168,15 @@ class PlanTDataset(Dataset):
             # ignore the first 5 and last two frames
             for seq in range(
                 5,
-                num_seq - self.cfg.model.waypoints.wps_len - self.cfg_train.seq_len - 2,
+                num_seq - self.cfg.model.waypoints.wps_len * self.wps_stride
+                - self.cfg_train.seq_len - 2,
             ):
                 # load input seq and pred seq jointly
                 label = []
                 measurement = []
                 for idx in range(
-                    self.cfg_train.seq_len + self.cfg.model.waypoints.wps_len
+                    self.cfg_train.seq_len
+                    + self.cfg.model.waypoints.wps_len * self.wps_stride
                 ):
                     labels_file = route_dir / "boxes" / f"{seq + idx:04d}.json.gz"
                     measurements_file = (
@@ -226,6 +239,14 @@ class PlanTDataset(Dataset):
         out["sign_id"] = int(self.sample_sign_ids[index])
         return out
 
+
+    def _cache_key(self, labels) -> str:
+        """Cache key. The stride changes the waypoints stored in a sample, so it
+        must be part of the key — otherwise a cache filled at stride 1 silently
+        serves stride-1 targets to a stride-2 run."""
+        key = labels[0].decode()
+        return key if self.wps_stride == 1 else f"{key}|s{self.wps_stride}"
+
     def add_parked_cars(self, sample):
         if self.cfg_train.augment_parked:
             n = np.random.randint(0, 10)
@@ -256,19 +277,19 @@ class PlanTDataset(Dataset):
 
         # See if we can use the cache
         if augment and self.data_cache is not None:
-            if labels[0].decode()+"_aug" in self.data_cache:
-                sample = self.data_cache[labels[0].decode()+"_aug"]
+            if self._cache_key(labels) + "_aug" in self.data_cache:
+                sample = self.data_cache[self._cache_key(labels) + "_aug"]
                 return self._attach_sign_id(sample, index)
 
-            elif labels[0].decode() in self.data_cache:
-                sample = self.transform(self.data_cache[labels[0].decode()])
+            elif self._cache_key(labels) in self.data_cache:
+                sample = self.transform(self.data_cache[self._cache_key(labels)])
                 sample.pop("BEV_aug", None)
                 sample.pop("output_floating", None)
-                self.data_cache[labels[0].decode()+"_aug"] = sample
+                self.data_cache[self._cache_key(labels) + "_aug"] = sample
                 return self._attach_sign_id(sample, index)
 
-        elif self.data_cache is not None and labels[0].decode() in self.data_cache:
-                sample = self.data_cache[labels[0].decode()]
+        elif self.data_cache is not None and self._cache_key(labels) in self.data_cache:
+                sample = self.data_cache[self._cache_key(labels)]
                 sample.pop("BEV_aug", None)
                 sample.pop("output_floating", None)
                 return self._attach_sign_id(sample, index)
@@ -287,7 +308,8 @@ class PlanTDataset(Dataset):
         # Extract ego waypoints
         matrices = [x["ego_matrix"] for x in loaded_measurements[self.cfg_train.seq_len - 1 :]]
         ego_inv = np.linalg.inv(matrices[0])
-        points = np.array(matrices[1:])[:,:,3]
+        wps_len = self.cfg.model.waypoints.wps_len
+        points = np.array(matrices[self.wps_stride::self.wps_stride][:wps_len])[:, :, 3]
         points = (ego_inv @ points.T).T[:,:2].tolist()
         sample["waypoints"] = points
 
@@ -491,14 +513,14 @@ class PlanTDataset(Dataset):
 
         # Store in data cache
         if self.data_cache is not None:
-            self.data_cache[labels[0].decode()] = sample # Save unaugmented sample with BEV_aug so we can use it later for aug
+            self.data_cache[self._cache_key(labels)] = sample # Save unaugmented sample with BEV_aug so we can use it later for aug
 
         if augment:
             sample = self.transform(sample)
             if self.data_cache is not None:
                 sample.pop("BEV_aug", None) # Augmented sample doesnt need BEV_aug since its the normal BEV
                 sample.pop("output_floating", None)
-                self.data_cache[labels[0].decode()+"_aug"] = sample
+                self.data_cache[self._cache_key(labels) + "_aug"] = sample
 
         sample.pop("BEV_aug", None)
         sample.pop("output_floating", None)
