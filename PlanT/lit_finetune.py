@@ -177,7 +177,11 @@ def main(cfg):
         enable_progress_bar=True,
     )
     if n_gpus > 1:
-        trainer_kw["strategy"] = "ddp"
+        # A single-sign finetune leaves most of tok_emb (one embedding per
+        # object type) out of the loss, and plain DDP refuses to run when any
+        # parameter goes unused. DDP_STRATEGY=ddp_find_unused_parameters_true
+        # allows it; the default stays plain ddp for full-mixture runs.
+        trainer_kw["strategy"] = os.environ.get("DDP_STRATEGY", "ddp")
 
     trainer = Trainer(**trainer_kw)
     torch.set_float32_matmul_precision("high")
