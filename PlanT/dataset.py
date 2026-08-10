@@ -57,6 +57,22 @@ class PlanTDataset(Dataset):
             print(f"[PlanTDataset] waypoint frame stride = {self.wps_stride} "
                   f"({0.1 * self.wps_stride:.1f} s between waypoints)")
 
+        # Our dumps label target_speed with the ego's *current* speed, and the
+        # model receives no ego-speed input — the label is unobservable, so CE
+        # is minimised by the marginal speed distribution and the head never
+        # predicts stopping. Upstream CARLA collection labels frames with the
+        # *commanded* speed instead (0 from the moment the stop is decided,
+        # while still moving). TS_LOOKAHEAD=1 approximates that from what is
+        # already on disk: the label becomes the minimum ego speed over the
+        # loaded future window (seq_len..seq_len+wps_len*stride frames), which
+        # is 0 throughout the approach to a stop — observable from the sign
+        # geometry and traffic in the frame.
+        self.ts_lookahead = str(os.environ.get(
+            "TS_LOOKAHEAD", self.cfg_train.get("ts_lookahead", 0)) or 0) not in ("0", "", "False", "false")
+        if self.ts_lookahead:
+            print("[PlanTDataset] target_speed = min ego speed over the "
+                  f"{self.cfg.model.waypoints.wps_len * self.wps_stride}-frame lookahead window")
+
         self.MAX_DISTANCE = self.cfg_train.range
         self.MAX_DISTANCE_DOUBLE = 2*self.MAX_DISTANCE
 
@@ -241,11 +257,16 @@ class PlanTDataset(Dataset):
 
 
     def _cache_key(self, labels) -> str:
-        """Cache key. The stride changes the waypoints stored in a sample, so it
-        must be part of the key — otherwise a cache filled at stride 1 silently
-        serves stride-1 targets to a stride-2 run."""
+        """Cache key. The stride changes the waypoints stored in a sample and
+        the lookahead mode changes target_speed, so both must be part of the
+        key — otherwise a cache filled under one mode silently serves its
+        targets to a run using the other."""
         key = labels[0].decode()
-        return key if self.wps_stride == 1 else f"{key}|s{self.wps_stride}"
+        if self.wps_stride != 1:
+            key = f"{key}|s{self.wps_stride}"
+        if self.ts_lookahead:
+            key = f"{key}|la"
+        return key
 
     def add_parked_cars(self, sample):
         if self.cfg_train.augment_parked:
@@ -298,7 +319,11 @@ class PlanTDataset(Dataset):
         loaded_labels = []
         loaded_measurements = []
 
-        for i in range(self.cfg_train.seq_len + self.cfg.model.waypoints.wps_len):
+        # The file lists hold seq_len + wps_len*stride entries; loading only
+        # seq_len + wps_len of them would leave the stride slice with wps_len/stride
+        # waypoints and crash the L1 loss on shape mismatch.
+        for i in range(self.cfg_train.seq_len
+                       + self.cfg.model.waypoints.wps_len * self.wps_stride):
             measurements_i = json.load(gzip.open(measurements[i]))
             labels_i = json.load(gzip.open(labels[i]))
 
@@ -320,6 +345,21 @@ class PlanTDataset(Dataset):
         sample["target_speed"] = meas_t["target_speed"]
         # Prefer explicit dump field; fall back to legacy ``speed``.
         sample["ego_speed"] = meas_t["ego_speed"] if "ego_speed" in meas_t else meas_t["speed"]
+
+        if self.ts_lookahead:
+            # Commanded-style label: the minimum ego speed over the loaded
+            # future window. A frame 1-2 s before a stop is labelled 0 while
+            # the car still moves — matching what upstream autopilot dumps —
+            # and, unlike the instantaneous speed, it is predictable from the
+            # sign geometry and traffic visible in the frame. Speeds under the
+            # dump's brake epsilon collapse to an exact 0.0 so the two-hot
+            # encoding puts full mass on bin 0. Only meaningful for routes
+            # whose label is the ego speed (priority signs); do not enable for
+            # posted-limit routes, where target_speed is the constant limit.
+            future = loaded_measurements[self.cfg_train.seq_len - 1:]
+            v = min(float(m["ego_speed"] if "ego_speed" in m else m["speed"])
+                    for m in future)
+            sample["target_speed"] = 0.0 if v < 0.5 else v
 
         speed_limit = loaded_measurements[self.cfg_train.seq_len - 1]["speed_limit"]
         speed_limit = round(speed_limit * 3.6)  # TODO

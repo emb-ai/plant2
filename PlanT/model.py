@@ -94,7 +94,12 @@ class HFLM(nn.Module):
             num_tokens = self.wp_len
 
         self.wp_token = nn.Parameter(torch.randn(num_tokens, self.n_embd))
-        self.speed_token = nn.Parameter(torch.randn((self.n_embd, )))
+        # Same scale as every other embedding (_init_weights uses std 0.02 but
+        # only touches Linear/Embedding/LayerNorm, not Parameters). At N(0,1)
+        # this token enters the pretrained trunk at ~50x the amplitude of its
+        # neighbours; the base checkpoint has no speed_token, so finetunes
+        # start from exactly this init.
+        self.speed_token = nn.Parameter(torch.randn((self.n_embd, )) * 0.02)
 
         if self.config_net.get("use_dropout", False):
             self.drop = nn.Dropout(config_net.embd_pdrop)
