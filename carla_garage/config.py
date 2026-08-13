@@ -427,7 +427,7 @@ class GlobalConfig:
     self.bev_semantic_weights = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
     # v4 target speeds (0.72*speed limits) plus extra classes for obstacle scenarios and intersections
-    self.target_speeds = [0.0, 4.0, 8.0, 10, 13.88888888, 16, 17.77777777, 20]
+    self.target_speeds = [0.0, 0.025, 0.05472609, 1.0, 1.5, 2.0, 4.0, 8.0, 10.0, 20.0]
 
     self.target_speed_bins = [x + 0.001 for x in self.target_speeds[1:]]  # not used with two hot encodings
     self.target_speed_weights = [1.0] * (len(self.target_speeds))

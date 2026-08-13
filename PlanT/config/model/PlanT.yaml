@@ -6,7 +6,7 @@ waypoints:
   path_len:  20
   wps_len: 8
 
-  bins_speed: 8
+  bins_speed: 10
 
   path_weight: 5
   wps_weight: 1
@@ -37,10 +37,10 @@ training:
   # Override via +model.training.stop_speed_loss_weight=10 or env STOP_SPEED_LOSS_WEIGHT.
   stop_speed_loss_weight: 1.0
   # Per-bin weights for soft two-hot ego-speed CE (length = bins_speed / target_speeds).
-  # null = uniform. Example stop-heavy: [15,1,1,1,1,1,1,1]
-  # Override via model.training.speed_class_weights=[15,1,1,1,1,1,1,1]
+  # null = uniform. Example stop-heavy (10 bins): [15,15,10,1,1,1,1,1,1,1]
+  # Override via model.training.speed_class_weights=[15,15,10,1.0,1.0,1.0,1.0,1.0,1.0,1.0]
   # or env SPEED_CLASS_WEIGHTS=15,1,1,1,1,1,1,1
-  speed_class_weights: null
+  speed_class_weights: [15, 15, 10, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
 pre_training:
   forecastLoss_weight: 1
