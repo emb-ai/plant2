@@ -289,9 +289,13 @@ class HFLM(nn.Module):
         remove_idxs += self.wp_token.shape[0]
 
         # add speed token to end
+        # remove_idxs counts tokens in FRONT of the objects; this one goes to the
+        # back, so it must not be added there — the forecasting slice below drops
+        # it with [:-1] instead. Incrementing here shifted that slice by one:
+        # object token j+1 was supervised with object j's box, and the trailing
+        # speed token (read by ego_speed_classifier) with the last object's.
         speed_tok = self.speed_token.expand(embedding.shape[0], 1, -1)
         embedding = torch.cat((embedding, speed_tok), dim=1)
-        remove_idxs += 1
 
         # embedding dropout
         if self.config_net.get("use_dropout", False):
@@ -306,7 +310,7 @@ class HFLM(nn.Module):
             targets = batch["y_objs"][batch_idxs]
             targets = [targets[..., i].flatten() for i in range(self.fc_attributes)] # Tensor to list of tensors
 
-            logits = x[:, remove_idxs:]
+            logits = x[:, remove_idxs:-1]  # objects only; -1 drops the speed token
             logits = [
                 self.heads[i](logits).flatten(end_dim=-2)
                 for i in range(self.fc_attributes)
