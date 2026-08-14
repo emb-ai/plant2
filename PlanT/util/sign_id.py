@@ -138,3 +138,34 @@ def resolve_sign_id_for_route(route_name: str, extra_map: Optional[dict[str, str
     if extra_map and route_name in extra_map:
         return sign_code_to_id(extra_map[route_name])
     return sign_code_to_id(resolve_route_sign(route_name))
+
+
+@lru_cache(maxsize=None)
+def sniff_sign_from_route(route_dir: str) -> Optional[str]:
+    """Read the PDD code out of a route's own boxes.
+
+    Route naming is not a reliable key: whole generations of dumps use names the
+    uid map never learned (every 2.5 route in the mixture split resolved to
+    "unknown"), which silently zeroes the sign token for exactly the scenes the
+    sign matters in. The boxes carry the code as the object class, so the frames
+    can answer when the name cannot. One small gz read per route, cached.
+    """
+    import gzip
+
+    boxes = sorted(Path(route_dir).glob("boxes/*.json.gz"))
+    if not boxes:
+        return None
+    known = set(SIGN_CODES)
+    # Signs enter the 30 m window part-way through a route; a few probes across
+    # it cost nothing and beat trusting the first frame.
+    for idx in {0, len(boxes) // 2, len(boxes) - 1, len(boxes) // 4, 3 * len(boxes) // 4}:
+        try:
+            with gzip.open(boxes[idx], "rt") as fh:
+                frame = json.load(fh)
+        except Exception:
+            continue
+        for obj in frame:
+            code = obj.get("pdd_code") or obj.get("class")
+            if isinstance(code, str) and code in known:
+                return code
+    return None

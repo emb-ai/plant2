@@ -21,6 +21,8 @@ from util.sign_id import (
     load_uid2sign,
     resolve_sign_id_for_route,
     route_name_from_label_path,
+    sign_code_to_id,
+    sniff_sign_from_route,
 )
 
 from scipy.spatial import cKDTree
@@ -228,16 +230,27 @@ class PlanTDataset(Dataset):
 
         sign_ids = []
         n_known = 0
+        n_sniffed = 0
         for lab in self.labels:
-            route_name = route_name_from_label_path(lab[0].decode())
+            label_path = lab[0].decode()
+            route_name = route_name_from_label_path(label_path)
             sid = resolve_sign_id_for_route(route_name, extra_map)
+            if sid == 0:
+                # The name maps nothing, but the route's own boxes carry the
+                # code. Without this every 2.5 route in the mixture trains with
+                # sign_id=0 while 4.3 gets its real token — an asymmetry that
+                # silently invalidates any comparison between the two.
+                code = sniff_sign_from_route(str(Path(label_path).parent.parent))
+                sid = sign_code_to_id(code)
+                if sid > 0:
+                    n_sniffed += 1
             if sid > 0:
                 n_known += 1
             sign_ids.append(sid)
         self.sample_sign_ids = np.asarray(sign_ids, dtype=np.int64)
         print(
             f"sign_id resolve: {n_known}/{len(sign_ids)} samples mapped "
-            f"(split_meta={split_meta.is_file()})"
+            f"({n_sniffed} from boxes, split_meta={split_meta.is_file()})"
         )
 
         print(f"Loading {len(self.labels)} samples")
