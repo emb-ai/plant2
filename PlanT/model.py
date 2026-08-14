@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -210,19 +211,44 @@ class HFLM(nn.Module):
             str(param_dict.keys() - union_params),
         )
 
+        # Parameters the pretrained checkpoint did not carry (every PDD sign
+        # tok_emb, sign_emb, speed_token, the ego-speed head) start from noise
+        # and, on one shared learning rate, barely move over a finetune. The set
+        # is filled by lit_finetune; empty here means "behave exactly as before".
+        fresh = {pn for pn in getattr(self, "fresh_params", set()) if pn in param_dict}
+        # PlanT.yaml writes `1e-4`, which YAML 1.1 reads as a string.
+        lr = float(train_config.learning_rate)
+        mult = float(os.environ.get("NEW_PARAM_LR_MULT", "1") or 1)
+
         # create the pytorch optimizer object
         optim_groups = [
             {
-                "params": [param_dict[pn] for pn in sorted(list(decay))],
+                "params": [param_dict[pn] for pn in sorted(decay - fresh)],
                 "weight_decay": train_config.weight_decay,
             },
             {
-                "params": [param_dict[pn] for pn in sorted(list(no_decay))],
+                "params": [param_dict[pn] for pn in sorted(no_decay - fresh)],
                 "weight_decay": 0.0,
             },
         ]
+        if fresh:
+            optim_groups += [
+                {
+                    "params": [param_dict[pn] for pn in sorted(decay & fresh)],
+                    "weight_decay": train_config.weight_decay,
+                    "lr": lr * mult,
+                },
+                {
+                    "params": [param_dict[pn] for pn in sorted(no_decay & fresh)],
+                    "weight_decay": 0.0,
+                    "lr": lr * mult,
+                },
+            ]
+            logger.info("optimiser: %d fresh parameters at lr=%g (x%g), %d pretrained at lr=%g",
+                        len(fresh), lr * mult, mult, len(param_dict) - len(fresh), lr)
+        optim_groups = [g for g in optim_groups if g["params"]]
         optimizer = torch.optim.AdamW(
-            optim_groups, lr=train_config.learning_rate, betas=train_config.betas
+            optim_groups, lr=lr, betas=tuple(float(b) for b in train_config.betas)
         )
         return optimizer
 

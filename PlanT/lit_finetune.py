@@ -27,6 +27,48 @@ from lit_module import LitHFLM
 from util.logging import setup_logging
 
 
+def _prepare_fresh_parameters(model, ckpt_path) -> None:
+    """Give the parameters the checkpoint does not carry a fighting chance.
+
+    They start from noise inside a pretrained trunk and, with one learning rate
+    for everything, an AdamW step moves a weight by about `lr`; over a 12-epoch
+    finetune that is roughly the initialisation scale itself, and a sign class
+    present in a tenth of the frames gets a tenth of that. Two env knobs:
+
+      INIT_SIGN_FROM_STOP=1   seed every PDD sign tok_emb from the trained
+                              stop_sign one (class 4) instead of random init
+      NEW_PARAM_LR_MULT=<x>   put the checkpoint-missing parameters in their own
+                              optimiser group at lr*x
+
+    Both default to off; the fresh-parameter set is computed either way so the
+    log always states what the checkpoint failed to provide.
+    """
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = sd.get("state_dict", sd)
+    fresh = {k for k in model.state_dict() if k not in sd}
+    # HFLM.configure_optimizers works in its own namespace, without the prefix.
+    model.model.fresh_params = {k[len("model."):] for k in fresh if k.startswith("model.")}
+    print(f"fresh parameters (absent from the checkpoint): {len(fresh)} tensors")
+
+    if os.environ.get("INIT_SIGN_FROM_STOP", "0").strip() in ("1", "true", "True"):
+        from plant_variables import PDD_OBJECT_CLASS_START
+
+        src = model.model.tok_emb[4]  # stop_sign: a small static object, like every PDD plate
+        seeded = 0
+        with torch.no_grad():
+            for i in range(PDD_OBJECT_CLASS_START, len(model.model.tok_emb)):
+                if f"tok_emb.{i}.weight" not in model.model.fresh_params:
+                    continue
+                dst = model.model.tok_emb[i]
+                dst.weight.copy_(src.weight)
+                dst.bias.copy_(src.bias)
+                # Identical copies would still diverge (each class sees its own
+                # frames), but a little jitter removes the tie from step one.
+                dst.weight.add_(torch.randn_like(dst.weight) * 0.02 * src.weight.std())
+                seeded += 1
+        print(f"seeded {seeded} PDD sign tok_emb from the trained stop_sign layer")
+
+
 @hydra.main(config_path="config", config_name="config", version_base=None)
 def main(cfg):
     print(OmegaConf.to_yaml(cfg))
@@ -158,6 +200,12 @@ def main(cfg):
         ckpt_in, cfg=cfg, strict=False, map_location="cpu"
     )
     model.cfg = cfg
+
+    # The pretrained checkpoint holds tok_emb.0-6 only (car..emergency). Every
+    # PDD sign class, sign_emb, speed_token and the ego-speed head are created
+    # from scratch on each finetune, yet they share the trunk's learning rate.
+    # Both knobs below default to off, so runs made before them stay comparable.
+    _prepare_fresh_parameters(model, ckpt_in)
 
     callbacks = [
         checkpoint_callback,
