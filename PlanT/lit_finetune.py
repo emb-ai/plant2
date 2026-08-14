@@ -9,6 +9,7 @@ Differences vs lit_train.py:
 """
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -180,7 +181,13 @@ def main(cfg):
     # Cosine+warmup needs total/warmup step counts before configure_optimizers.
     sched_name = str(cfg.get("lr_scheduler", "multistep")).lower()
     if sched_name == "cosine_warmup":
-        steps_per_epoch = len(train_loader)
+        # DistributedSampler is attached by the trainer, after this point: the
+        # loader still has its full length here, while each rank will really run
+        # 1/world_size of it. Sizing the schedule off the full length stretched
+        # it by the number of GPUs -- on 8 GPUs the 10% warmup covered 80% of the
+        # run and the cosine decay never started.
+        world_size = max(1, int(cfg.gpus))
+        steps_per_epoch = max(1, math.ceil(len(train_loader) / world_size))
         total_steps = steps_per_epoch * int(cfg.model.training.max_epochs)
         warmup_ratio = float(cfg.get("warmup_ratio", 0.1))
         warmup_steps = max(1, int(warmup_ratio * total_steps))
