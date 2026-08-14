@@ -219,16 +219,23 @@ class HFLM(nn.Module):
         # PlanT.yaml writes `1e-4`, which YAML 1.1 reads as a string.
         lr = float(train_config.learning_rate)
         mult = float(os.environ.get("NEW_PARAM_LR_MULT", "1") or 1)
+        # A finetune whose learning rate actually takes effect costs driving
+        # competence: lane keeping collapsed (off-road 5% -> 44%) while the sign
+        # channels barely moved. TRUNK_LR_MULT scales what the checkpoint already
+        # knows; 0 freezes it and trains only what it never had.
+        trunk_mult = float(os.environ.get("TRUNK_LR_MULT", "1"))
 
         # create the pytorch optimizer object
         optim_groups = [
             {
                 "params": [param_dict[pn] for pn in sorted(decay - fresh)],
                 "weight_decay": train_config.weight_decay,
+                "lr": lr * trunk_mult,
             },
             {
                 "params": [param_dict[pn] for pn in sorted(no_decay - fresh)],
                 "weight_decay": 0.0,
+                "lr": lr * trunk_mult,
             },
         ]
         if fresh:
@@ -244,8 +251,9 @@ class HFLM(nn.Module):
                     "lr": lr * mult,
                 },
             ]
-            logger.info("optimiser: %d fresh parameters at lr=%g (x%g), %d pretrained at lr=%g",
-                        len(fresh), lr * mult, mult, len(param_dict) - len(fresh), lr)
+            logger.info("optimiser: %d fresh parameters at lr=%g (x%g), %d pretrained at lr=%g (x%g)",
+                        len(fresh), lr * mult, mult,
+                        len(param_dict) - len(fresh), lr * trunk_mult, trunk_mult)
         optim_groups = [g for g in optim_groups if g["params"]]
         optimizer = torch.optim.AdamW(
             optim_groups, lr=lr, betas=tuple(float(b) for b in train_config.betas)
