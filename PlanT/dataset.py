@@ -496,7 +496,12 @@ class PlanTDataset(Dataset):
                 x["position"][0],
                 x["position"][1],
                 rad2deg(x["yaw"]),  # in degrees
-                0.0,
+                # Static objects do not move, so this slot was a constant 0.
+                # Speed-limit plates (3.24 / 5.31 / 4.6) now carry the number
+                # written on them here, in km/h: it is the only channel that
+                # tells 20 from 60 apart, since both share one PDD class.
+                # Everything else still dumps speed 0 and is unaffected.
+                x.get("speed", 0.0) * 3.6,
                 x["extent"][1]*2,
                 x["extent"][0]*2,
                 -1 if (x["class"] if x["class"] in self.type_nums else x["class"].lower()) != "static_car" else -999,
