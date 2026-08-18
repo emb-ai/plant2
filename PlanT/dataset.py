@@ -78,6 +78,11 @@ class PlanTDataset(Dataset):
             print("[PlanTDataset] target_speed = min ego speed over the "
                   f"{self.cfg.model.waypoints.wps_len * self.wps_stride}-frame lookahead window")
 
+        # How far a PDD sign stays in the input. Must match the dump's
+        # PLANT2_SIGN_RADIUS_M: the tighter of the two wins, silently.
+        self.sign_radius = float(os.environ.get(
+            "PLANT2_SIGN_RADIUS_M", self.cfg_train.get("sign_radius", 120.0)) or 120.0)
+
         self.MAX_DISTANCE = self.cfg_train.range
         self.MAX_DISTANCE_DOUBLE = 2*self.MAX_DISTANCE
 
@@ -438,8 +443,17 @@ class PlanTDataset(Dataset):
             if "position" in x:
                 pos_x, pos_y, pos_z = x["position"]
 
-                # 30m radius for TL / stop / PDD sign objects
-                if x["class"] in (["traffic_light"] + list(sign_like)):
+                # A traffic light or a CARLA stop sign matters within 30 m —
+                # its rule bites at a point. A PDD sign governs a zone that runs
+                # 103 m at the median, and with seq_len=1 there is no memory to
+                # carry it, so the sign itself has to stay in frame: the dump
+                # writes it out to PLANT2_SIGN_RADIUS_M and this must not throw
+                # it away again. The radius was hardcoded in both places, so
+                # widening it in the dump alone changed nothing.
+                if x["class"] in pdd_classes:
+                    if pos_x**2 + pos_y**2 > self.sign_radius**2 or abs(pos_z) > 30:
+                        x["class"] = "too far"
+                elif x["class"] in (["traffic_light", "stop_sign"]):
                     if pos_x**2 + pos_y**2 > 30**2 or abs(pos_z) > 30:
                         x["class"] = "too far"
                 # ellipse for others
