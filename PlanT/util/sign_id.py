@@ -35,9 +35,38 @@ SIGN_CODES: tuple[str, ...] = (
     "5.31",
 )
 
-# 0 = unknown; 1..N = SIGN_CODES
-SIGN_CATS: dict[str, int] = {code: i + 1 for i, code in enumerate(SIGN_CODES)}
-NUM_SIGN_CLASSES: int = 1 + len(SIGN_CODES)
+# Plates that carry a number, and the numbers they can carry (km/h). The code
+# alone cannot say WHICH limit applies: 3.24 at 20 and 3.24 at 40 demand
+# opposite behaviour from the same class, and the spatial token only says so
+# while the sign is in frame. The route-level id therefore distinguishes them.
+SIGN_VALUE_CODES: tuple[str, ...] = ("3.24", "5.31", "4.6")
+SIGN_VALUES_KMH: tuple[int, ...] = (20, 30, 40, 50, 60)
+
+
+def qualified_sign_code(code: Optional[str], value_kmh=None) -> Optional[str]:
+    """`"3.24"` + 20 -> `"3.24@20"`; anything without a number stays as it is."""
+    if not code:
+        return code
+    code = str(code).strip()
+    if value_kmh is None or code not in SIGN_VALUE_CODES:
+        return code
+    try:
+        v = int(round(float(value_kmh)))
+    except (TypeError, ValueError):
+        return code
+    if v not in SIGN_VALUES_KMH:
+        v = min(SIGN_VALUES_KMH, key=lambda k: abs(k - v))
+    return f"{code}@{v}"
+
+
+# The id vocabulary: every plain code, then one entry per (valued code, value).
+SIGN_ID_VOCAB: tuple[str, ...] = SIGN_CODES + tuple(
+    f"{c}@{v}" for c in SIGN_VALUE_CODES for v in SIGN_VALUES_KMH
+)
+
+# 0 = unknown; 1..N = SIGN_ID_VOCAB
+SIGN_CATS: dict[str, int] = {code: i + 1 for i, code in enumerate(SIGN_ID_VOCAB)}
+NUM_SIGN_CLASSES: int = 1 + len(SIGN_ID_VOCAB)
 
 _EXPERTS_ROOT = Path("/home/jovyan/shares/SR006.nfs3/shepelev/collected_trajectories")
 _EXPERT_JSONLS = (
@@ -56,10 +85,16 @@ _SUMO_SIGN_RE = re.compile(
 )
 
 
-def sign_code_to_id(code: Optional[str]) -> int:
+def sign_code_to_id(code: Optional[str], value_kmh=None) -> int:
+    """Embedding index for a code, optionally qualified by the plate's number.
+
+    An unknown pairing falls back to the plain code rather than to 0: losing the
+    value is a loss of precision, losing the sign is a loss of the sign.
+    """
     if not code:
         return 0
-    return SIGN_CATS.get(str(code).strip(), 0)
+    q = qualified_sign_code(code, value_kmh)
+    return SIGN_CATS.get(q, SIGN_CATS.get(str(code).strip(), 0))
 
 
 def sign_of_route_name(name: str) -> Optional[str]:
@@ -140,6 +175,16 @@ def resolve_sign_id_for_route(route_name: str, extra_map: Optional[dict[str, str
     return sign_code_to_id(resolve_route_sign(route_name))
 
 
+def _probe_indices(n: int, probes: int = 60) -> list[int]:
+    """Evenly spaced frame indices to search, cheapest-first coverage."""
+    if n <= 0:
+        return []
+    if n <= probes:
+        return list(range(n))
+    step = n / float(probes)
+    return sorted({min(n - 1, int(i * step)) for i in range(probes)})
+
+
 @lru_cache(maxsize=None)
 def sniff_sign_from_route(route_dir: str) -> Optional[str]:
     """Read the PDD code out of a route's own boxes.
@@ -156,9 +201,11 @@ def sniff_sign_from_route(route_dir: str) -> Optional[str]:
     if not boxes:
         return None
     known = set(SIGN_CODES)
-    # Signs enter the 30 m window part-way through a route; a few probes across
-    # it cost nothing and beat trusting the first frame.
-    for idx in {0, len(boxes) // 2, len(boxes) - 1, len(boxes) // 4, 3 * len(boxes) // 4}:
+    # A sign occupies a window of the route, not the whole of it, and with a
+    # tight visibility radius that window can be one per cent of the frames —
+    # five probes would miss it and the route would silently train with no sign.
+    # Scan evenly and stop at the first hit; the read ends as soon as it works.
+    for idx in _probe_indices(len(boxes)):
         try:
             with gzip.open(boxes[idx], "rt") as fh:
                 frame = json.load(fh)
@@ -168,4 +215,33 @@ def sniff_sign_from_route(route_dir: str) -> Optional[str]:
             code = obj.get("pdd_code") or obj.get("class")
             if isinstance(code, str) and code in known:
                 return code
+    return None
+
+
+@lru_cache(maxsize=None)
+def sniff_sign_value_from_route(route_dir: str):
+    """The number on the route's plate (km/h), read from its own boxes.
+
+    The route name never carries it — `sumo_3.24_1507406_…` is the same string
+    whether the plate says 20 or 40 — so the value has to come from the frames,
+    where the dump writes it as `sign_value_kmh`. Returns None when the plate
+    carries no number.
+    """
+    import gzip
+
+    boxes = sorted(Path(route_dir).glob("boxes/*.json.gz"))
+    if not boxes:
+        return None
+    for idx in _probe_indices(len(boxes)):
+        try:
+            with gzip.open(boxes[idx], "rt") as fh:
+                frame = json.load(fh)
+        except Exception:
+            continue
+        for obj in frame:
+            code = obj.get("pdd_code") or obj.get("class")
+            if isinstance(code, str) and code in SIGN_VALUE_CODES:
+                val = obj.get("sign_value_kmh")
+                if val is not None:
+                    return float(val)
     return None

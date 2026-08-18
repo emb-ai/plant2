@@ -16,6 +16,9 @@ import glob
 from plant_variables import PlanTVariables
 from util.static_extents import CAR_EXTENTS, STATIC_EXTENTS
 from util.sign_id import (
+    SIGN_VALUE_CODES,
+    sign_of_route_name,
+    sniff_sign_value_from_route,
     SIGN_CODES,
     load_split_meta_route2sign,
     load_uid2sign,
@@ -229,19 +232,30 @@ class PlanTDataset(Dataset):
                 extra_map.setdefault(f"{uid}_{var}", sign)
 
         sign_ids = []
+        n_valued = 0
         n_known = 0
         n_sniffed = 0
         for lab in self.labels:
             label_path = lab[0].decode()
             route_name = route_name_from_label_path(label_path)
+            route_dir = str(Path(label_path).parent.parent)
             sid = resolve_sign_id_for_route(route_name, extra_map)
+            # A speed plate's number is not in its route name, so an id resolved
+            # by name alone cannot tell 3.24-at-20 from 3.24-at-40 — the two
+            # demand opposite speeds from the same token. Read it from the boxes.
+            code_by_name = sign_of_route_name(route_name)
+            if sid > 0 and code_by_name in SIGN_VALUE_CODES:
+                val = sniff_sign_value_from_route(route_dir)
+                if val is not None:
+                    sid = sign_code_to_id(code_by_name, val)
+                    n_valued += 1
             if sid == 0:
                 # The name maps nothing, but the route's own boxes carry the
                 # code. Without this every 2.5 route in the mixture trains with
                 # sign_id=0 while 4.3 gets its real token — an asymmetry that
                 # silently invalidates any comparison between the two.
-                code = sniff_sign_from_route(str(Path(label_path).parent.parent))
-                sid = sign_code_to_id(code)
+                code = sniff_sign_from_route(route_dir)
+                sid = sign_code_to_id(code, sniff_sign_value_from_route(route_dir))
                 if sid > 0:
                     n_sniffed += 1
             if sid > 0:
@@ -250,7 +264,8 @@ class PlanTDataset(Dataset):
         self.sample_sign_ids = np.asarray(sign_ids, dtype=np.int64)
         print(
             f"sign_id resolve: {n_known}/{len(sign_ids)} samples mapped "
-            f"({n_sniffed} from boxes, split_meta={split_meta.is_file()})"
+            f"({n_sniffed} from boxes, {n_valued} with the plate value, "
+            f"split_meta={split_meta.is_file()})"
         )
 
         print(f"Loading {len(self.labels)} samples")
