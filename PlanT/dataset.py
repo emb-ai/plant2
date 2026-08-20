@@ -267,6 +267,7 @@ class PlanTDataset(Dataset):
                 n_known += 1
             sign_ids.append(sid)
         self.sample_sign_ids = np.asarray(sign_ids, dtype=np.int64)
+        self.sample_weights, self.frame_meta = self._load_frame_meta(root)
         print(
             f"sign_id resolve: {n_known}/{len(sign_ids)} samples mapped "
             f"({n_sniffed} from boxes, {n_valued} with the plate value, "
@@ -282,10 +283,73 @@ class PlanTDataset(Dataset):
         """Returns the length of the dataset."""
         return len(self.measurements)
 
+    def _load_frame_meta(self, root):
+        """Per-sample sampling weight + the metadata the sign metrics need.
+
+        Written by scripts/plant2_ft_pipeline/data/make_sample_weights.py. When
+        the file is absent every frame weighs 1 and the metrics see an empty
+        denominator -- exactly the behaviour before this existed.
+        """
+        n = len(self.labels)
+        weights = np.ones(n, dtype=np.float32)
+        meta = {
+            # Carried into the batch so the metrics can see which frames the
+            # sampler favoured without reaching back into the dataset.
+            "frame_weight": weights,
+            "in_zone": np.zeros(n, dtype=np.float32),
+            "plate_kmh": np.zeros(n, dtype=np.float32),
+            "detour_side": np.zeros(n, dtype=np.float32),
+            "cones_ahead": np.zeros(n, dtype=np.float32),
+        }
+        path = Path(root).parent / "sample_weights.json"
+        if not path.is_file():
+            print(f"sample weights: {path} absent -- uniform sampling, sign metrics idle")
+            return weights, meta
+
+        info = json.loads(path.read_text())
+        # 4.2.1 passes the obstacle on the right, 4.2.2 on the left
+        # (traffic_signs/detour_sign.py). Sign of the lateral offset, not a
+        # class id, so the metric can compare it against a waypoint directly.
+        side_num = {"right": 1.0, "left": -1.0}
+        sets = {name: (set(e.get("in_zone") or ()), set(e.get("cones") or ()))
+                for name, e in info.items()}
+
+        n_hot = n_zone = n_cones = 0
+        for i, lab in enumerate(self.labels):
+            label_path = Path(lab[0].decode())
+            route = label_path.parent.parent.name
+            entry = info.get(route)
+            if entry is None:
+                continue
+            seq = int(label_path.name.split(".")[0])
+            in_zone, cones = sets[route]
+
+            transient = entry.get("transient")
+            if transient and transient[0] <= seq <= transient[1]:
+                weights[i] = float(entry.get("w", 1.0))
+                n_hot += 1
+            if seq in in_zone:
+                meta["in_zone"][i] = 1.0
+                n_zone += 1
+            if seq in cones:
+                meta["cones_ahead"][i] = 1.0
+                n_cones += 1
+            plate = entry.get("plate")
+            if plate:
+                meta["plate_kmh"][i] = float(plate)
+            meta["detour_side"][i] = side_num.get(entry.get("side"), 0.0)
+
+        share = 100.0 * n_hot / max(1, n)
+        print(f"sample weights: {n_hot}/{n} frames upweighted ({share:.1f}% of the split), "
+              f"in_zone={n_zone} cones_ahead={n_cones}")
+        return weights, meta
+
     def _attach_sign_id(self, sample, index: int):
         """Shallow-copy and set sign_id without mutating diskcache entries."""
         out = dict(sample)
         out["sign_id"] = int(self.sample_sign_ids[index])
+        for key, arr in self.frame_meta.items():
+            out[key] = float(arr[index])
         return out
 
 

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import hydra
 import pytorch_lightning as pl
+import numpy as np
 import torch
 import wandb
 from omegaconf import OmegaConf, open_dict
@@ -175,7 +176,31 @@ def main(cfg):
         loader_kw["persistent_workers"] = True
         loader_kw["prefetch_factor"] = 2
 
-    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kw)
+    # Uniform frame sampling under-represents the very frames a sign explains:
+    # a speed plate's braking transient is 7-10 frames of an episode of several
+    # hundred. CUSTOM_SAMPLER draws frames by the weights make_sample_weights.py
+    # precomputed instead.
+    use_sampler = str(os.environ.get("CUSTOM_SAMPLER", "0")).strip() in ("1", "true", "True")
+    train_sampler = None
+    if use_sampler:
+        from util.weighted_sampler import DistributedWeightedSampler
+
+        world_size = max(1, int(cfg.gpus))
+        rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", 0)))
+        train_sampler = DistributedWeightedSampler(
+            train_dataset.sample_weights,
+            num_replicas=world_size,
+            rank=rank,
+            seed=int(os.environ.get("SEED", "1")),
+        )
+        w = np.asarray(train_dataset.sample_weights)
+        print(f"custom sampler: world_size={world_size} rank={rank} "
+              f"per_rank_samples={len(train_sampler)} "
+              f"upweighted={int((w > 1).sum())}/{len(w)} "
+              f"expected_hot_share={float(w[w > 1].sum() / w.sum()):.3f}")
+
+    train_loader = DataLoader(train_dataset, shuffle=train_sampler is None,
+                              sampler=train_sampler, **loader_kw)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_kw)
 
     # Cosine+warmup needs total/warmup step counts before configure_optimizers.
@@ -187,7 +212,11 @@ def main(cfg):
         # it by the number of GPUs -- on 8 GPUs the 10% warmup covered 80% of the
         # run and the cosine decay never started.
         world_size = max(1, int(cfg.gpus))
-        steps_per_epoch = max(1, math.ceil(len(train_loader) / world_size))
+        # DistributedWeightedSampler is already per-rank, so len(train_loader)
+        # is the real per-rank step count. Only the DistributedSampler Lightning
+        # attaches on its own arrives after this point and needs the division.
+        steps_per_epoch = (max(1, len(train_loader)) if train_sampler is not None
+                           else max(1, math.ceil(len(train_loader) / world_size)))
         total_steps = steps_per_epoch * int(cfg.model.training.max_epochs)
         warmup_ratio = float(cfg.get("warmup_ratio", 0.1))
         warmup_steps = max(1, int(warmup_ratio * total_steps))
@@ -231,6 +260,11 @@ def main(cfg):
         max_epochs=cfg.model.training.max_epochs,
         enable_progress_bar=True,
     )
+    if train_sampler is not None:
+        # Lightning would otherwise wrap our sampler in a DistributedSampler,
+        # sharding the weights instead of the draw and leaving each rank with
+        # its own pool.
+        trainer_kw["use_distributed_sampler"] = False
     if n_gpus > 1:
         # A single-sign finetune leaves most of tok_emb (one embedding per
         # object type) out of the loss, and plain DDP refuses to run when any

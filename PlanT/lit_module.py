@@ -97,6 +97,7 @@ class LitHFLM(pl.LightningModule):
 
         logits, targets, pred_plan, _ = self(batch)
 
+        twohot_for_metrics = None
         losses = {}
 
         (pred_path, pred_wps, pred_speed) = pred_plan
@@ -111,6 +112,7 @@ class LitHFLM(pl.LightningModule):
             target_speeds = torch.tensor(self.plant_variables.target_speeds, device=targetspeed_batch.device)
             brake = torch.zeros_like(targetspeed_batch, dtype=torch.bool, device=targetspeed_batch.device)
             twohot_targs = self.get_two_hot_encoding(targetspeed_batch, target_speeds, brake)
+            twohot_for_metrics = twohot_targs
 
             # Soft two-hot targets: CE with class probabilities (float N×C).
             # Manual form is robust across torch builds that reject multi-dim CE targets.
@@ -200,6 +202,8 @@ class LitHFLM(pl.LightningModule):
                         batch_size=self.cfg.model.training.batch_size,
                     )
 
+        self._log_sign_metrics(batch, pred_speed, pred_wps, twohot_for_metrics, "train")
+
         return loss_all
 
     def validation_step(self, batch, batch_idx):
@@ -211,6 +215,7 @@ class LitHFLM(pl.LightningModule):
 
         logits, targets, pred_plan, _ = self(batch)
         (pred_path, pred_wps, pred_speed) = pred_plan
+        twohot_for_metrics = None
         losses = {}
         if pred_wps is not None:
             losses["loss_wp"] = F.l1_loss(pred_wps, waypoints_batch)
@@ -226,6 +231,7 @@ class LitHFLM(pl.LightningModule):
             twohot_targs = self.get_two_hot_encoding(
                 targetspeed_batch, target_speeds, brake
             )
+            twohot_for_metrics = twohot_targs
             log_probs = F.log_softmax(pred_speed, dim=-1)
             cw = self._speed_class_weights_tensor(
                 device=log_probs.device, dtype=log_probs.dtype, n_classes=log_probs.shape[-1]
@@ -276,12 +282,70 @@ class LitHFLM(pl.LightningModule):
             sync_dist=self.cfg.gpus > 1,
             batch_size=self.cfg.model.training.batch_size,
         )
+        self._log_sign_metrics(batch, pred_speed, pred_wps, twohot_for_metrics, "val")
+
         return loss_all
 
     def on_after_backward(self):
         torch.nn.utils.clip_grad_norm_(
             self.model.parameters(), self.cfg_train.grad_norm_clip
         )
+
+    def _log_sign_metrics(self, batch, pred_speed, pred_wps, twohot_targs, stage):
+        """Sign-rule metrics on expert frames, open loop.
+
+        The benchmark scores a speed sign per step as
+        ``is_vehicle_in_zone(v) and v.speed_km_h > limit``
+        (traffic_signs/zone_signs.py). Here the predicted speed stands in for
+        the driven one, and ``in_zone`` is a proxy computed in
+        make_sample_weights.py: the plate is visible and behind the ego. The
+        zone outlives the 120 m sign radius, so late frames leave the
+        denominator -- which is why the denominator is logged next to the rate.
+
+        Errors do not compound the way they do in a rollout, so these numbers
+        run optimistic against run_benchmark.py. They are for watching a run
+        move and for comparing two runs, not for reporting compliance.
+        """
+        bs = self.cfg.model.training.batch_size
+        dist = self.cfg.gpus > 1
+
+        def _log(name, value):
+            self.log(f"{stage}/{name}", value, on_step=False, on_epoch=True,
+                     sync_dist=dist, batch_size=bs)
+
+        if "frame_weight" in batch:
+            _log("transient_share", (batch["frame_weight"] > 1.0).float().mean())
+
+        if pred_speed is not None and twohot_targs is not None:
+            pred_bin = pred_speed.argmax(dim=-1)
+            _log("acc_egospeed", (pred_bin == twohot_targs.argmax(dim=-1)).float().mean())
+
+            if "in_zone" in batch and "plate_kmh" in batch:
+                speeds = torch.tensor(self.plant_variables.target_speeds,
+                                      device=pred_speed.device, dtype=torch.float32)
+                pred_kmh = speeds[pred_bin] * 3.6
+                plate = batch["plate_kmh"].reshape(-1).to(pred_kmh.dtype)
+                in_zone = (batch["in_zone"].reshape(-1) > 0.5) & (plate > 0)
+                n_zone = in_zone.sum()
+                _log("sign_zone_frames", n_zone.float())
+                if n_zone > 0:
+                    obeys = (pred_kmh[in_zone] <= plate[in_zone]).float().mean()
+                    _log("sign_compliance_speed", obeys)
+
+        if pred_wps is not None and "detour_side" in batch:
+            # Waypoints live in the ego frame of build_ego_matrix, "x-forward,
+            # y-left"; detour_side is +1 when the sign says pass on the right.
+            # Passing on the right moves the ego to negative y, hence the flip.
+            side = batch["detour_side"].reshape(-1)
+            expected = -side
+            cones = (batch.get("cones_ahead", torch.zeros_like(side)).reshape(-1) > 0.5)
+            mask = cones & (side != 0)
+            n_side = mask.sum()
+            _log("detour_side_frames", n_side.float())
+            if n_side > 0:
+                lateral = pred_wps[:, -1, 1].reshape(-1)
+                hit = (torch.sign(lateral[mask]) == torch.sign(expected[mask])).float().mean()
+                _log("detour_side_acc", hit)
 
     def _stop_speed_loss_weight(self) -> float:
         """Per-sample multiplier for stop targets (target_speed≈0).

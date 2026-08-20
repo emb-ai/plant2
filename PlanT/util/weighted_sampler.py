@@ -42,6 +42,13 @@ class DistributedWeightedSampler(Sampler):
         self.rank = int(rank)
         self.seed = int(seed)
         self.epoch = 0
+        # Lightning calls set_epoch on the samplers it manages, but this one is
+        # opted out of that management (use_distributed_sampler=False), and an
+        # epoch counter stuck at 0 would hand every epoch the same draw. Fall
+        # back to counting __iter__ calls, and stop as soon as anyone sets the
+        # epoch explicitly so the two never fight.
+        self._epoch_was_set = False
+        self._auto_epoch = 0
 
         n = int(num_samples if num_samples is not None else self.weights.numel())
         # Round up so every rank gets the same count: an uneven split makes DDP
@@ -51,11 +58,15 @@ class DistributedWeightedSampler(Sampler):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+        self._epoch_was_set = True
 
     def __iter__(self):
+        epoch = self.epoch if self._epoch_was_set else self._auto_epoch
         g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
+        g.manual_seed(self.seed + epoch)
         idx = torch.multinomial(self.weights, self.total_size, replacement=True, generator=g)
+        if not self._epoch_was_set:
+            self._auto_epoch += 1
         return iter(idx[self.rank::self.num_replicas].tolist())
 
     def __len__(self) -> int:
