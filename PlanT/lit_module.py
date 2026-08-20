@@ -332,20 +332,18 @@ class LitHFLM(pl.LightningModule):
                     obeys = (pred_kmh[in_zone] <= plate[in_zone]).float().mean()
                     _log("sign_compliance_speed", obeys)
 
-        if pred_wps is not None and "detour_side" in batch:
-            # Waypoints live in the ego frame of build_ego_matrix, "x-forward,
-            # y-left"; detour_side is +1 when the sign says pass on the right.
-            # Passing on the right moves the ego to negative y, hence the flip.
-            side = batch["detour_side"].reshape(-1)
-            expected = -side
-            cones = (batch.get("cones_ahead", torch.zeros_like(side)).reshape(-1) > 0.5)
-            mask = cones & (side != 0)
-            n_side = mask.sum()
-            _log("detour_side_frames", n_side.float())
-            if n_side > 0:
-                lateral = pred_wps[:, -1, 1].reshape(-1)
-                hit = (torch.sign(lateral[mask]) == torch.sign(expected[mask])).float().mean()
-                _log("detour_side_acc", hit)
+        # There was a detour_side_acc here: the sign of the predicted lateral
+        # offset against the side the sign prescribes. It is deleted rather
+        # than fixed, because the quantity does not exist per frame. Scored on
+        # the expert's OWN waypoints it reads 0.443, and 0.198 within 15 m of
+        # the obstacle -- the ego-frame lateral flips sign between the outbound
+        # leg and the return, so near the obstacle the metric mostly catches
+        # the return. The median lateral over the 0.8 s horizon is 0.101 m,
+        # noise next to lane curvature. Which side the ego actually passed on
+        # is stateful (detour_sign.py keeps entered_zone / changed_correctly
+        # across steps) and belongs to the closed-loop run_benchmark.py.
+        # loss_wp already measures whether the manoeuvre is imitated: it fell
+        # to 0.042 m against a 1.23 m median motion on the overfit split.
 
     def _stop_speed_loss_weight(self) -> float:
         """Per-sample multiplier for stop targets (target_speed≈0).
