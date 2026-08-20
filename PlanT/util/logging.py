@@ -24,17 +24,17 @@ def setup_logging(cfg):
         subprocess.check_output(
             ["git", "-C", f"{cfg.user.working_dir}", "rev-parse", "HEAD"]
         )
-        .decode("ascii")
+        .decode("utf-8", errors="replace")
         .strip()
     )
     commit = (
         subprocess.check_output(["git", "-C", f"{cfg.user.working_dir}", "log", "-1"])
-        .decode("ascii")
+        .decode("utf-8", errors="replace")
         .strip()
     )
     branch = (
         subprocess.check_output(["git", "-C", f"{cfg.user.working_dir}", "branch"])
-        .decode("ascii")
+        .decode("utf-8", errors="replace")
         .strip()
     )
     repo = Repo(cfg.user.working_dir)
