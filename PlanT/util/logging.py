@@ -5,10 +5,59 @@ import subprocess
 import argparse
 import logging
 
-from git import Repo
+from git import InvalidGitRepositoryError, Repo
 from omegaconf import OmegaConf
 from pathlib import Path
 from datetime import datetime
+
+
+def _git_candidates(cfg):
+    """Prefer Hydra working_dir, then this PlanT tree / repo root (never a missing host path)."""
+    seen = []
+    try:
+        wd = getattr(getattr(cfg, "user", None), "working_dir", None)
+        if wd:
+            seen.append(Path(str(wd)))
+    except Exception:
+        pass
+    here = Path(__file__).resolve()
+    # util/logging.py → PlanT → plant2 → traffic-rule-bench
+    seen.extend([here.parents[2], here.parents[3], Path.cwd()])
+    out = []
+    for p in seen:
+        try:
+            p = p.resolve()
+        except Exception:
+            continue
+        if p.is_dir() and p not in out:
+            out.append(p)
+    return out
+
+
+def _resolve_git_dir(cfg):
+    for p in _git_candidates(cfg):
+        r = subprocess.run(
+            ["git", "-C", str(p), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if r.returncode == 0:
+            top = Path(r.stdout.strip())
+            if top.is_dir():
+                return top
+    return None
+
+
+def _git_output(git_dir, *args):
+    return (
+        subprocess.check_output(
+            ["git", "-C", str(git_dir), *args],
+            stderr=subprocess.DEVNULL,
+        )
+        .decode("ascii", errors="replace")
+        .strip()
+    )
 
 
 def setup_logging(cfg):
@@ -19,35 +68,35 @@ def setup_logging(cfg):
     with open(os.path.join(cfg.model.training.log_path, "args.txt"), "w") as f:
         json.dump(args.__dict__, f, indent=2)
 
-    # Log git
-    sha = (
-        subprocess.check_output(
-            ["git", "-C", f"{cfg.user.working_dir}", "rev-parse", "HEAD"]
-        )
-        .decode("ascii")
-        .strip()
-    )
-    commit = (
-        subprocess.check_output(["git", "-C", f"{cfg.user.working_dir}", "log", "-1"])
-        .decode("ascii")
-        .strip()
-    )
-    branch = (
-        subprocess.check_output(["git", "-C", f"{cfg.user.working_dir}", "branch"])
-        .decode("ascii")
-        .strip()
-    )
-    repo = Repo(cfg.user.working_dir)
-
+    git_dir = _resolve_git_dir(cfg)
     with open(os.path.join(cfg.model.training.log_path, "git_info.txt"), "w") as f:
-        # write current date and time
         f.write(
             f"Run started at: {str(datetime.now().strftime('%d/%m/%Y %H:%M:%S'))}\n"
         )
-        f.write(f"Git state: {sha}\n")
-        f.write(f"Git commit: {commit}\n")
-        f.write(f"Git branch: {branch}\n\n")
-        f.write(f"{repo.git.diff('HEAD')}")
+        if git_dir is None:
+            f.write("Git state: unavailable (no git repo found under working_dir/plant2)\n")
+        else:
+            try:
+                sha = _git_output(git_dir, "rev-parse", "HEAD")
+                commit = _git_output(git_dir, "log", "-1")
+                branch = _git_output(git_dir, "branch")
+                f.write(f"Git dir: {git_dir}\n")
+                f.write(f"Git state: {sha}\n")
+                f.write(f"Git commit: {commit}\n")
+                f.write(f"Git branch: {branch}\n\n")
+                try:
+                    repo = Repo(str(git_dir), search_parent_directories=True)
+                    f.write(f"{repo.git.diff('HEAD')}")
+                except (InvalidGitRepositoryError, Exception):
+                    diff = subprocess.run(
+                        ["git", "-C", str(git_dir), "diff", "HEAD"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    )
+                    f.write(diff.stdout or "")
+            except (subprocess.CalledProcessError, OSError) as e:
+                f.write(f"Git state: unavailable ({e})\n")
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",

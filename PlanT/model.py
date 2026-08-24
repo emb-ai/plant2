@@ -12,7 +12,7 @@ from transformers import (
 import timm
 
 from plant_variables import PlanTVariables
-from util.sign_id import NUM_SIGN_CLASSES, SIGN_CODES
+from util.sign_id import SIGN_CODES
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +22,16 @@ class HFLM(nn.Module):
         self.config_all = config_all
         self.config_net = config_net
 
-        # Object class id → dedicated Linear tok_emb[i] (NOT nn.Embedding).
+        # Shared object-class embedding (cars, peds, signs, …). Class ids come
+        # from x_objs[..., 0] via PlanTVariables.class_nums — including one unique
+        # index per PDD code in SIGN_CODES (no separate sign_id token).
         # 0:padding, 1:car, 2:walker, 3:static, 4:stop_sign, 5:traffic_light, 6:emergency,
-        # 7..: one index per PDD code in SIGN_CODES (see PlanTVariables.class_nums).
+        # 7..: one index per PDD code in SIGN_CODES.
         self.object_types = PlanTVariables.num_object_types()
         self.num_attributes = 6  # x,y,yaw,speed/id, extent x, extent y
         self.fc_attributes = 4
         logger.info(
-            "tok_emb object_types=%d (PDD codes=%d: %s)",
+            "class_emb object_types=%d (PDD codes=%d: %s)",
             self.object_types,
             len(SIGN_CODES),
             ",".join(SIGN_CODES),
@@ -64,10 +66,9 @@ class HFLM(nn.Module):
         if self.input_bev:
             self.bev_encoder = timm.create_model("resnet18", pretrained=True, num_classes=512)
 
-        # token embedding (ModuleList so state_dict keys are tok_emb.0.weight, ...)
-        self.tok_emb = nn.ModuleList(
-            [nn.Linear(self.num_attributes, self.n_embd) for _ in range(self.object_types)]
-        )
+        # Object token = shared class embedding + continuous attribute projection.
+        self.class_emb = nn.Embedding(self.object_types, self.n_embd)
+        self.attr_emb = nn.Linear(self.num_attributes, self.n_embd)
 
         self.wp_rep = self.config_all.model.waypoints.representation
         self.wp_gen = self.config_all.model.waypoints.generator
@@ -102,8 +103,6 @@ class HFLM(nn.Module):
         self.route_emb = nn.Linear(20*2, self.n_embd)
 
         self.speed_emb = nn.Embedding(4, self.n_embd)
-        # Explicit PDD sign-type token (route-resolved at load time). Index 0 = unknown.
-        self.sign_emb = nn.Embedding(NUM_SIGN_CLASSES, self.n_embd)
 
         self.input_ego_speed = self.config_all.model.training.get("input_ego_speed", False)
         if self.input_ego_speed:
@@ -227,17 +226,11 @@ class HFLM(nn.Module):
         x_batch_objs = batch["x_objs"]
         route_batch = batch["route_original"]
         speed_limit_batch = batch["speed_limit"]
-        # Remove type and embed.
-        # Pre-compute class ids and features once so that the mask, embedding, and
-        # feature tensor are all derived from the same shape — avoids any mismatch
-        # when x_batch_objs is a batched 3-D tensor (B, pool, 7).
-        class_ids = x_batch_objs[..., 0].long()   # (pool,) or (B, pool)
-        obj_feats = x_batch_objs[..., 1:]          # (pool, 6) or (B, pool, 6)
-        embedding = torch.zeros(*class_ids.shape, self.n_embd, device=x_batch_objs.device)
-        for i in range(len(self.tok_emb)):
-            mask = class_ids == i
-            if mask.any():
-                embedding[mask] = self.tok_emb[i](obj_feats[mask])
+        # Embed class_id via shared nn.Embedding; continuous attrs via Linear.
+        # Supports 2-D pool (pool, 7) or batched 3-D (B, pool, 7).
+        class_ids = x_batch_objs[..., 0].long().clamp(0, self.object_types - 1)
+        obj_feats = x_batch_objs[..., 1:]
+        embedding = self.class_emb(class_ids) + self.attr_emb(obj_feats)
 
         # Restore batch shape: select per-sample objects from the pool.
         # 2-D pool  (pool, n_embd)      → embedding[batch_idxs]        gives (B, maxseq, n_embd)
@@ -258,13 +251,6 @@ class HFLM(nn.Module):
 
         # How many tokens at the front before objects
         remove_idxs = 2
-
-        # Explicit sign-class token (optional for backward compat with old eval batches)
-        if "sign_id" in batch and batch["sign_id"] is not None:
-            sign_ids = batch["sign_id"].long()
-            sign_tok = self.sign_emb(sign_ids)[:, None]
-            embedding = torch.cat((sign_tok, embedding), dim=1)
-            remove_idxs += 1
 
         # Add ego_speed:
         if self.input_ego_speed:

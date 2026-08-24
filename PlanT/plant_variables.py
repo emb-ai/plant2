@@ -1,6 +1,6 @@
 from util.sign_id import SIGN_CODES
 
-# tok_emb index for the first PDD object class (after emergency=6).
+# class_emb index for the first PDD object class (after emergency=6).
 PDD_OBJECT_CLASS_START = 7
 
 
@@ -22,14 +22,14 @@ class PlanTVariables:
                     "stop_sign": 4.0,
                     "traffic_light": 5.0,
                     "emergency": 6.0,
-                    # One unique tok_emb index per PDD code (boxes["class"] == code).
+                    # One unique class_emb index per PDD code (boxes["class"] == code).
                     **{
                         code: float(PDD_OBJECT_CLASS_START + i)
                         for i, code in enumerate(SIGN_CODES)
                     },
                  }
 
-    # Classes written into boxes that are spatial PDD signs (not the global sign_emb).
+    # Spatial PDD sign classes written into boxes / x_objs (shared object stream).
     pdd_object_classes = frozenset(SIGN_CODES)
     
     car_types = ["car", "walker","emergency"]
@@ -38,5 +38,5 @@ class PlanTVariables:
 
     @staticmethod
     def num_object_types() -> int:
-        """Size of tok_emb ModuleList (= max class index + 1, including padding 0)."""
+        """Size of class_emb (= max class index + 1, including padding 0)."""
         return int(max(PlanTVariables.class_nums.values())) + 1
