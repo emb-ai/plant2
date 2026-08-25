@@ -18,6 +18,9 @@ training:
   range: 50
   range_factor_front: 2
   input_ego_speed: False
+  # Share of training frames whose route token is zeroed, so the manoeuvre
+  # cannot be produced by copying the route alone. 0 keeps the old behaviour.
+  route_dropout: 0.0
   input_bev: True
   input_static_cars: True
 

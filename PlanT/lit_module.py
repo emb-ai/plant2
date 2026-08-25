@@ -88,6 +88,35 @@ class LitHFLM(pl.LightningModule):
         )
         return [optimizer], [scheduler]
 
+    def _wps_weight(self) -> float:
+        """Weight of the waypoint head.
+
+        The config names this `wps_weight`; the code used to read `wp_weight`,
+        a key nothing defines, so the value was always the default and raising
+        it in the config did nothing at all. Both spellings are accepted now so
+        older configs keep working.
+        """
+        wp = self.cfg.model.waypoints
+        for key in ("wps_weight", "wp_weight"):
+            if key in wp:
+                return float(wp[key])
+        return 1.0
+
+    def _path_loss(self, pred_path, path_batch):
+        """L1 on the route head, skipping frames whose route input was hidden.
+
+        Route dropout removes the route token from a share of training frames;
+        asking those frames to reproduce the route would punish the model for
+        not seeing it, which is the opposite of the intent.
+        """
+        drop = getattr(self.model, "last_route_drop", None)
+        if drop is None or not bool(drop.any()):
+            return F.l1_loss(pred_path, path_batch)
+        keep = ~drop
+        if not bool(keep.any()):
+            return pred_path.sum() * 0.0
+        return F.l1_loss(pred_path[keep], path_batch[keep])
+
     def training_step(self, batch, batch_idx):
         waypoints_batch = batch["waypoints"]
         path_batch = batch["route"]
@@ -106,7 +135,7 @@ class LitHFLM(pl.LightningModule):
             losses["loss_wp"] = F.l1_loss(pred_wps, waypoints_batch)
 
         if pred_path is not None:
-            losses["loss_path"] = F.l1_loss(pred_path, path_batch)
+            losses["loss_path"] = self._path_loss(pred_path, path_batch)
 
         if pred_speed is not None:
             target_speeds = torch.tensor(self.plant_variables.target_speeds, device=targetspeed_batch.device)
@@ -152,7 +181,7 @@ class LitHFLM(pl.LightningModule):
             )
 
         weights = {
-            "loss_wp": self.cfg.model.waypoints.get("wp_weight", 1), 
+            "loss_wp": self._wps_weight(),
             "loss_forecast": self.cfg.model.pre_training.get("forecastLoss_weight", 0),
             "loss_path": self.cfg.model.waypoints.get("path_weight", 1),
             "loss_egospeed": self.cfg.model.waypoints.get("speed_weight", 1),
@@ -220,7 +249,7 @@ class LitHFLM(pl.LightningModule):
         if pred_wps is not None:
             losses["loss_wp"] = F.l1_loss(pred_wps, waypoints_batch)
         if pred_path is not None:
-            losses["loss_path"] = F.l1_loss(pred_path, path_batch)
+            losses["loss_path"] = self._path_loss(pred_path, path_batch)
         if pred_speed is not None:
             target_speeds = torch.tensor(
                 self.plant_variables.target_speeds, device=targetspeed_batch.device
@@ -256,7 +285,7 @@ class LitHFLM(pl.LightningModule):
         losses["loss_forecast"] = torch.mean(torch.stack(losses_forecast))
 
         weights = {
-            "loss_wp": self.cfg.model.waypoints.get("wp_weight", 1),
+            "loss_wp": self._wps_weight(),
             "loss_forecast": self.cfg.model.pre_training.get("forecastLoss_weight", 0),
             "loss_path": self.cfg.model.waypoints.get("path_weight", 1),
             "loss_egospeed": self.cfg.model.waypoints.get("speed_weight", 1),

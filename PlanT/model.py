@@ -106,6 +106,10 @@ class HFLM(nn.Module):
             self.drop = nn.Dropout(config_net.embd_pdrop)
 
         self.route_emb = nn.Linear(20*2, self.n_embd)
+        # Share of training frames that see a zeroed route token (see forward()).
+        self.route_dropout = float(
+            self.config_all.model.training.get("route_dropout", 0.0))
+        self.last_route_drop = None
 
         self.speed_emb = nn.Embedding(4, self.n_embd)
         # Explicit PDD sign-type token (route-resolved at load time). Index 0 = unknown.
@@ -288,6 +292,20 @@ class HFLM(nn.Module):
             embedding = embedding[row, batch_idxs]
 
         # Add axis in second dim (B x 1 x 512)
+        # Route dropout. The route is both an input token and the target of
+        # loss_path, so copying it satisfies the heaviest term in the loss; near
+        # an obstacle the route only bends once the manoeuvre has begun, which
+        # leaves nothing to copy at the moment the manoeuvre must start. Hiding
+        # the route on a share of frames forces the other tokens -- cones, sign,
+        # BEV -- to carry the decision. Training only; eval always sees it.
+        route_batch = route_batch.clone()
+        route_drop = None
+        if self.training and self.route_dropout > 0.0:
+            keep = torch.rand(route_batch.shape[0], device=route_batch.device)
+            route_drop = keep < self.route_dropout
+            if route_drop.any():
+                route_batch[route_drop] = 0.0
+        self.last_route_drop = route_drop
         route_tok = self.route_emb(route_batch.flatten(1))[:, None]
         embedding = torch.cat((route_tok, embedding), dim=1) # Add route to front
 
