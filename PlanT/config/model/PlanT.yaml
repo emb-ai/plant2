@@ -21,6 +21,13 @@ training:
   # Share of training frames whose route token is zeroed, so the manoeuvre
   # cannot be produced by copying the route alone. 0 keeps the old behaviour.
   route_dropout: 0.0
+  # Target of loss_path. "route" reproduces the route token the model is also
+  # given as input, so the steering head is an autoencoder and a lateral offset
+  # decays back to the lane centre. "future" targets the ego's realised
+  # trajectory instead. path_horizon_frames sets how far ahead it is read
+  # (0.1 s per frame); 40 covers ~40 m at 10 m/s, enough for the 20 m path.
+  path_target: route
+  path_horizon_frames: 40
   input_bev: True
   input_static_cars: True
 

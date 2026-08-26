@@ -78,6 +78,30 @@ class PlanTDataset(Dataset):
             print("[PlanTDataset] target_speed = min ego speed over the "
                   f"{self.cfg.model.waypoints.wps_len * self.wps_stride}-frame lookahead window")
 
+        # loss_path's target is interpolate_route(route) while the model's route
+        # token is route_original, and the dump writes both from one array
+        # (plant2_frames.py:610-611). The head that steers is therefore trained
+        # to reproduce an input it already holds, which is satisfied without
+        # reading the sign or the obstacle -- and closed-loop the route is the
+        # centre of the lane the ego is already in, so a lateral offset decays
+        # as soon as it appears. "future" retargets the head to the ego's
+        # realised trajectory, making a held offset the thing the loss rewards.
+        self.path_target = str(os.environ.get(
+            "PATH_TARGET", self.cfg_train.get("path_target", "route")) or "route").lower()
+        if self.path_target not in ("route", "future"):
+            raise ValueError(
+                f"path_target must be 'route' or 'future', got {self.path_target!r}")
+        self.path_horizon = int(os.environ.get(
+            "PATH_HORIZON_FRAMES", self.cfg_train.get("path_horizon_frames", 40)) or 40)
+        # Frames a sample needs after the current one: the waypoints need
+        # wps_len*stride, the realised-future path needs enough travel to fill
+        # path_len metres at the 1 m spacing interpolate_route resamples to.
+        self.future_frames = self.cfg.model.waypoints.wps_len * self.wps_stride
+        if self.path_target == "future":
+            self.future_frames = max(self.future_frames, self.path_horizon)
+            print(f"[PlanTDataset] loss_path target = realised future over "
+                  f"{self.path_horizon} frames ({0.1 * self.path_horizon:.1f} s)")
+
         # How far a PDD sign stays in the input. Must match the dump's
         # PLANT2_SIGN_RADIUS_M: the tighter of the two wins, silently.
         self.sign_radius = float(os.environ.get(
@@ -194,16 +218,12 @@ class PlanTDataset(Dataset):
             # ignore the first 5 and last two frames
             for seq in range(
                 5,
-                num_seq - self.cfg.model.waypoints.wps_len * self.wps_stride
-                - self.cfg_train.seq_len - 2,
+                num_seq - self.future_frames - self.cfg_train.seq_len - 2,
             ):
                 # load input seq and pred seq jointly
                 label = []
                 measurement = []
-                for idx in range(
-                    self.cfg_train.seq_len
-                    + self.cfg.model.waypoints.wps_len * self.wps_stride
-                ):
+                for idx in range(self.cfg_train.seq_len + self.future_frames):
                     labels_file = route_dir / "boxes" / f"{seq + idx:04d}.json.gz"
                     measurements_file = (
                         route_dir / "measurements" / f"{seq + idx:04d}.json.gz"
@@ -363,7 +383,35 @@ class PlanTDataset(Dataset):
             key = f"{key}|s{self.wps_stride}"
         if self.ts_lookahead:
             key = f"{key}|la"
+        if self.path_target != "route":
+            key = f"{key}|pf{self.path_horizon}"
         return key
+
+    def _future_path(self, loaded_measurements):
+        """The ego's realised future in the current ego frame, arc-length
+        resampled the same way the route target is, so pred_path keeps its
+        geometric meaning while no longer being a copy of its own input token.
+
+        build_ego_matrix writes LOCAL as (x-forward, y-left), the convention the
+        dump flips the route into, so the two targets are directly comparable.
+        When the expert travels less than the path length -- slow frames, the
+        end of an episode -- the trajectory is extended along its final heading
+        rather than clamped, which would otherwise collapse the tail of the
+        target onto one point and teach the head to plan a stop.
+        """
+        i0 = self.cfg_train.seq_len - 1
+        mats = np.asarray([m["ego_matrix"] for m in loaded_measurements[i0:]],
+                          dtype=np.float64)
+        pts = (np.linalg.inv(mats[0]) @ mats[:, :, 3].T).T[:, :2]
+        path_len = int(self.cfg.model.waypoints.path_len)
+        travelled = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+        if travelled < path_len + 1.0 and len(pts) > 2:
+            step = pts[-1] - pts[-2]
+            norm = float(np.linalg.norm(step))
+            if norm > 1e-6:
+                pts = np.vstack(
+                    [pts, pts[-1] + step / norm * (path_len + 1.0 - travelled)])
+        return interpolate_route(pts[1:])
 
     def add_parked_cars(self, sample):
         if self.cfg_train.augment_parked:
@@ -416,16 +464,17 @@ class PlanTDataset(Dataset):
         loaded_labels = []
         loaded_measurements = []
 
-        # The file lists hold seq_len + wps_len*stride entries; loading only
-        # seq_len + wps_len of them would leave the stride slice with wps_len/stride
-        # waypoints and crash the L1 loss on shape mismatch.
-        for i in range(self.cfg_train.seq_len
-                       + self.cfg.model.waypoints.wps_len * self.wps_stride):
-            measurements_i = json.load(gzip.open(measurements[i]))
-            labels_i = json.load(gzip.open(labels[i]))
-
-            loaded_labels.append(labels_i)
-            loaded_measurements.append(measurements_i)
+        # Measurements are needed across the whole future window: the stride
+        # slice would otherwise yield wps_len/stride waypoints and crash the L1
+        # loss on shape mismatch, and the realised-future path needs the frames
+        # beyond that. Boxes are read only at the current frame and at the
+        # forecasting offset (+1), so loading the rest is pure I/O.
+        n_meas = min(len(measurements), self.cfg_train.seq_len + self.future_frames)
+        n_lab = min(len(labels), self.cfg_train.seq_len + 1)
+        for i in range(n_meas):
+            loaded_measurements.append(json.load(gzip.open(measurements[i])))
+        for i in range(n_lab):
+            loaded_labels.append(json.load(gzip.open(labels[i])))
 
         # Extract ego waypoints
         matrices = [x["ego_matrix"] for x in loaded_measurements[self.cfg_train.seq_len - 1 :]]
@@ -436,7 +485,11 @@ class PlanTDataset(Dataset):
         sample["waypoints"] = points
 
         sample["route_original"] = loaded_measurements[self.cfg_train.seq_len - 1]["route_original"][:20]
-        sample["route"] = interpolate_route(loaded_measurements[self.cfg_train.seq_len - 1]["route"][:20])
+        if self.path_target == "future":
+            sample["route"] = self._future_path(loaded_measurements)
+        else:
+            sample["route"] = interpolate_route(
+                loaded_measurements[self.cfg_train.seq_len - 1]["route"][:20])
 
         meas_t = loaded_measurements[self.cfg_train.seq_len - 1]
         sample["target_speed"] = meas_t["target_speed"]
