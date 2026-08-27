@@ -214,12 +214,17 @@ class LitHFLM(pl.LightningModule):
                     batch_size=self.cfg.model.training.batch_size,
                 )
 
-                mask = targets[i].squeeze() != -999
+                # squeeze() collapses a single-target batch to 0-d, and the
+                # mask then indexes nothing the metric can use -- reshape keeps
+                # the sample axis whatever the count. Mixed speed+detour batches
+                # reach one forecast target often enough to hit this.
+                tgt = targets[i].reshape(-1)
+                mask = tgt != -999
                 # Skip Accuracy on empty selection (e.g. sign-only tokens with no
                 # forecast targets) — torchmetrics cannot reshape a 0-length tensor.
                 if mask.any():
                     self.metrics_forecasting_acc[i](
-                        logits[i][mask], targets[i][mask].squeeze()
+                        logits[i].reshape(tgt.shape[0], -1)[mask], tgt[mask]
                     )
                     self.log(
                         f"train/acc_{name}",
