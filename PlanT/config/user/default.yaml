@@ -1,0 +1,7 @@
+# The plant2 checkout this run logs against (git metadata in util/logging.py)
+# and writes `PlanT/checkpoints_ft/<run>` under.
+#
+# `scripts/plant2_ft_pipeline` always overrides this on the Hydra command line
+# (`user.working_dir=...`). Left mandatory so a bare `python lit_train.py` says
+# what is missing instead of writing checkpoints into someone else's home.
+working_dir: ???

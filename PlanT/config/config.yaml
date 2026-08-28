@@ -1,5 +1,5 @@
 defaults:
-  - user: TODO_your_username
+  - user: default
   - model: PlanT
 
 exp_folder_name: PlanT2_train
