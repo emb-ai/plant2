@@ -18,6 +18,16 @@ training:
   range: 50
   range_factor_front: 2
   input_ego_speed: False
+  # Share of training frames whose route token is zeroed, so the manoeuvre
+  # cannot be produced by copying the route alone. 0 keeps the old behaviour.
+  route_dropout: 0.0
+  # Target of loss_path. "route" reproduces the route token the model is also
+  # given as input, so the steering head is an autoencoder and a lateral offset
+  # decays back to the lane centre. "future" targets the ego's realised
+  # trajectory instead. path_horizon_frames sets how far ahead it is read
+  # (0.1 s per frame); 40 covers ~40 m at 10 m/s, enough for the 20 m path.
+  path_target: route
+  path_horizon_frames: 40
   input_bev: True
   input_static_cars: True
 
@@ -33,6 +43,14 @@ training:
   seq_len: 1
   augment: True
   augment_parked: True
+  # Multiply ego-speed CE for samples with target_speed < 0.5 m/s (stops).
+  # Override via +model.training.stop_speed_loss_weight=10 or env STOP_SPEED_LOSS_WEIGHT.
+  stop_speed_loss_weight: 1.0
+  # Per-bin weights for soft two-hot ego-speed CE (length = bins_speed / target_speeds).
+  # null = uniform. Example stop-heavy: [15,1,1,1,1,1,1,1]
+  # Override via model.training.speed_class_weights=[15,1,1,1,1,1,1,1]
+  # or env SPEED_CLASS_WEIGHTS=15,1,1,1,1,1,1,1
+  speed_class_weights: null
 
 pre_training:
   forecastLoss_weight: 1

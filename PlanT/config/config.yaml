@@ -15,6 +15,12 @@ hydra:
         item_sep: '_'
 
 lrDecay_epoch: 29
+# multistep (pretrain default) | cosine_warmup (fine-tune)
+lr_scheduler: multistep
+warmup_ratio: 0.1
+# filled by lit_finetune when lr_scheduler=cosine_warmup
+total_training_steps: 0
+warmup_steps: 0
 
 # Seed is set by environment variable
 # seed: 1234

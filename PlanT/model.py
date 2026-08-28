@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,9 @@ from transformers import (
 
 import timm
 
+from plant_variables import PlanTVariables
+from util.sign_id import NUM_SIGN_CLASSES, SIGN_CODES
+
 logger = logging.getLogger(__name__)
 
 class HFLM(nn.Module):
@@ -19,12 +23,18 @@ class HFLM(nn.Module):
         self.config_all = config_all
         self.config_net = config_net
 
-        # 0:padding, 1:vehicle, 2:pedestrian, 3:static, 4:stop_sign, 5:traffic_light, 6:emergency_vehicle,
-        # 7:speed_limit_sign, 8:min_speed_sign, 9:no_entry_sign, 10:no_stopping_sign,
-        # 11:detour_sign, 12:restricted_lane_sign, 13:only_auto_sign
-        self.object_types = 14  # 13 object types + 1 padding
+        # Object class id → dedicated Linear tok_emb[i] (NOT nn.Embedding).
+        # 0:padding, 1:car, 2:walker, 3:static, 4:stop_sign, 5:traffic_light, 6:emergency,
+        # 7..: one index per PDD code in SIGN_CODES (see PlanTVariables.class_nums).
+        self.object_types = PlanTVariables.num_object_types()
         self.num_attributes = 6  # x,y,yaw,speed/id, extent x, extent y
         self.fc_attributes = 4
+        logger.info(
+            "tok_emb object_types=%d (PDD codes=%d: %s)",
+            self.object_types,
+            len(SIGN_CODES),
+            ",".join(SIGN_CODES),
+        )
 
         precisions = [
             self.config_all.model.pre_training.get("precision_pos", 4),
@@ -85,14 +95,25 @@ class HFLM(nn.Module):
             num_tokens = self.wp_len
 
         self.wp_token = nn.Parameter(torch.randn(num_tokens, self.n_embd))
-        self.speed_token = nn.Parameter(torch.randn((self.n_embd, )))
+        # Same scale as every other embedding (_init_weights uses std 0.02 but
+        # only touches Linear/Embedding/LayerNorm, not Parameters). At N(0,1)
+        # this token enters the pretrained trunk at ~50x the amplitude of its
+        # neighbours; the base checkpoint has no speed_token, so finetunes
+        # start from exactly this init.
+        self.speed_token = nn.Parameter(torch.randn((self.n_embd, )) * 0.02)
 
         if self.config_net.get("use_dropout", False):
             self.drop = nn.Dropout(config_net.embd_pdrop)
 
         self.route_emb = nn.Linear(20*2, self.n_embd)
+        # Share of training frames that see a zeroed route token (see forward()).
+        self.route_dropout = float(
+            self.config_all.model.training.get("route_dropout", 0.0))
+        self.last_route_drop = None
 
         self.speed_emb = nn.Embedding(4, self.n_embd)
+        # Explicit PDD sign-type token (route-resolved at load time). Index 0 = unknown.
+        self.sign_emb = nn.Embedding(NUM_SIGN_CLASSES, self.n_embd)
 
         self.input_ego_speed = self.config_all.model.training.get("input_ego_speed", False)
         if self.input_ego_speed:
@@ -129,7 +150,9 @@ class HFLM(nn.Module):
             self.speed_classifier = nn.Linear(self.n_embd, self.config_all.model.waypoints.bins_speed)  # TODO im paper schauen
 
         # Ego speed classifier: predicts discretised ego speed for all wp_rep modes
-        self.ego_speed_classifier = nn.Linear(self.n_embd, 10)
+        self.ego_speed_classifier = nn.Linear(
+            self.n_embd, self.config_all.model.waypoints.bins_speed
+        )
 
         self.apply(self._init_weights)
 
@@ -192,19 +215,52 @@ class HFLM(nn.Module):
             str(param_dict.keys() - union_params),
         )
 
+        # Parameters the pretrained checkpoint did not carry (every PDD sign
+        # tok_emb, sign_emb, speed_token, the ego-speed head) start from noise
+        # and, on one shared learning rate, barely move over a finetune. The set
+        # is filled by lit_finetune; empty here means "behave exactly as before".
+        fresh = {pn for pn in getattr(self, "fresh_params", set()) if pn in param_dict}
+        # PlanT.yaml writes `1e-4`, which YAML 1.1 reads as a string.
+        lr = float(train_config.learning_rate)
+        mult = float(os.environ.get("NEW_PARAM_LR_MULT", "1") or 1)
+        # A finetune whose learning rate actually takes effect costs driving
+        # competence: lane keeping collapsed (off-road 5% -> 44%) while the sign
+        # channels barely moved. TRUNK_LR_MULT scales what the checkpoint already
+        # knows; 0 freezes it and trains only what it never had.
+        trunk_mult = float(os.environ.get("TRUNK_LR_MULT", "1"))
+
         # create the pytorch optimizer object
         optim_groups = [
             {
-                "params": [param_dict[pn] for pn in sorted(list(decay))],
+                "params": [param_dict[pn] for pn in sorted(decay - fresh)],
                 "weight_decay": train_config.weight_decay,
+                "lr": lr * trunk_mult,
             },
             {
-                "params": [param_dict[pn] for pn in sorted(list(no_decay))],
+                "params": [param_dict[pn] for pn in sorted(no_decay - fresh)],
                 "weight_decay": 0.0,
+                "lr": lr * trunk_mult,
             },
         ]
+        if fresh:
+            optim_groups += [
+                {
+                    "params": [param_dict[pn] for pn in sorted(decay & fresh)],
+                    "weight_decay": train_config.weight_decay,
+                    "lr": lr * mult,
+                },
+                {
+                    "params": [param_dict[pn] for pn in sorted(no_decay & fresh)],
+                    "weight_decay": 0.0,
+                    "lr": lr * mult,
+                },
+            ]
+            logger.info("optimiser: %d fresh parameters at lr=%g (x%g), %d pretrained at lr=%g (x%g)",
+                        len(fresh), lr * mult, mult,
+                        len(param_dict) - len(fresh), lr * trunk_mult, trunk_mult)
+        optim_groups = [g for g in optim_groups if g["params"]]
         optimizer = torch.optim.AdamW(
-            optim_groups, lr=train_config.learning_rate, betas=train_config.betas
+            optim_groups, lr=lr, betas=tuple(float(b) for b in train_config.betas)
         )
         return optimizer
 
@@ -236,6 +292,20 @@ class HFLM(nn.Module):
             embedding = embedding[row, batch_idxs]
 
         # Add axis in second dim (B x 1 x 512)
+        # Route dropout. The route is both an input token and the target of
+        # loss_path, so copying it satisfies the heaviest term in the loss; near
+        # an obstacle the route only bends once the manoeuvre has begun, which
+        # leaves nothing to copy at the moment the manoeuvre must start. Hiding
+        # the route on a share of frames forces the other tokens -- cones, sign,
+        # BEV -- to carry the decision. Training only; eval always sees it.
+        route_batch = route_batch.clone()
+        route_drop = None
+        if self.training and self.route_dropout > 0.0:
+            keep = torch.rand(route_batch.shape[0], device=route_batch.device)
+            route_drop = keep < self.route_dropout
+            if route_drop.any():
+                route_batch[route_drop] = 0.0
+        self.last_route_drop = route_drop
         route_tok = self.route_emb(route_batch.flatten(1))[:, None]
         embedding = torch.cat((route_tok, embedding), dim=1) # Add route to front
 
@@ -245,6 +315,13 @@ class HFLM(nn.Module):
 
         # How many tokens at the front before objects
         remove_idxs = 2
+
+        # Explicit sign-class token (optional for backward compat with old eval batches)
+        if "sign_id" in batch and batch["sign_id"] is not None:
+            sign_ids = batch["sign_id"].long()
+            sign_tok = self.sign_emb(sign_ids)[:, None]
+            embedding = torch.cat((sign_tok, embedding), dim=1)
+            remove_idxs += 1
 
         # Add ego_speed:
         if self.input_ego_speed:
@@ -264,9 +341,13 @@ class HFLM(nn.Module):
         remove_idxs += self.wp_token.shape[0]
 
         # add speed token to end
+        # remove_idxs counts tokens in FRONT of the objects; this one goes to the
+        # back, so it must not be added there — the forecasting slice below drops
+        # it with [:-1] instead. Incrementing here shifted that slice by one:
+        # object token j+1 was supervised with object j's box, and the trailing
+        # speed token (read by ego_speed_classifier) with the last object's.
         speed_tok = self.speed_token.expand(embedding.shape[0], 1, -1)
         embedding = torch.cat((embedding, speed_tok), dim=1)
-        remove_idxs += 1
 
         # embedding dropout
         if self.config_net.get("use_dropout", False):
@@ -281,7 +362,7 @@ class HFLM(nn.Module):
             targets = batch["y_objs"][batch_idxs]
             targets = [targets[..., i].flatten() for i in range(self.fc_attributes)] # Tensor to list of tensors
 
-            logits = x[:, remove_idxs:]
+            logits = x[:, remove_idxs:-1]  # objects only; -1 drops the speed token
             logits = [
                 self.heads[i](logits).flatten(end_dim=-2)
                 for i in range(self.fc_attributes)

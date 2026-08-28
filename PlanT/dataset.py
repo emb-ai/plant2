@@ -15,6 +15,18 @@ import glob
 
 from plant_variables import PlanTVariables
 from util.static_extents import CAR_EXTENTS, STATIC_EXTENTS
+from util.sign_id import (
+    SIGN_VALUE_CODES,
+    sign_of_route_name,
+    sniff_sign_value_from_route,
+    SIGN_CODES,
+    load_split_meta_route2sign,
+    load_uid2sign,
+    resolve_sign_id_for_route,
+    route_name_from_label_path,
+    sign_code_to_id,
+    sniff_sign_from_route,
+)
 
 from scipy.spatial import cKDTree
 
@@ -38,6 +50,62 @@ class PlanTDataset(Dataset):
         self.plant_vars = PlanTVariables
 
         self.data_cache = shared_dict
+
+        # Frames are dumped at the MetaDrive decision rate (0.1 s), while the
+        # pretrained PlanT and both controllers assume 0.25 s between waypoints
+        # (the *4.0 in PlanT_agent / plant2_control is 1/dt). Sampling every
+        # `wps_stride`-th frame restores that horizon without a re-dump.
+        # 1 = old behaviour (0.8 s of waypoints), 2 = 1.6 s, 3 = 2.4 s.
+        self.wps_stride = int(os.environ.get(
+            "WPS_STRIDE", self.cfg_train.get("wps_stride", 1)) or 1)
+        if self.wps_stride > 1:
+            print(f"[PlanTDataset] waypoint frame stride = {self.wps_stride} "
+                  f"({0.1 * self.wps_stride:.1f} s between waypoints)")
+
+        # Our dumps label target_speed with the ego's *current* speed, and the
+        # model receives no ego-speed input — the label is unobservable, so CE
+        # is minimised by the marginal speed distribution and the head never
+        # predicts stopping. Upstream CARLA collection labels frames with the
+        # *commanded* speed instead (0 from the moment the stop is decided,
+        # while still moving). TS_LOOKAHEAD=1 approximates that from what is
+        # already on disk: the label becomes the minimum ego speed over the
+        # loaded future window (seq_len..seq_len+wps_len*stride frames), which
+        # is 0 throughout the approach to a stop — observable from the sign
+        # geometry and traffic in the frame.
+        self.ts_lookahead = str(os.environ.get(
+            "TS_LOOKAHEAD", self.cfg_train.get("ts_lookahead", 0)) or 0) not in ("0", "", "False", "false")
+        if self.ts_lookahead:
+            print("[PlanTDataset] target_speed = min ego speed over the "
+                  f"{self.cfg.model.waypoints.wps_len * self.wps_stride}-frame lookahead window")
+
+        # loss_path's target is interpolate_route(route) while the model's route
+        # token is route_original, and the dump writes both from one array
+        # (plant2_frames.py:610-611). The head that steers is therefore trained
+        # to reproduce an input it already holds, which is satisfied without
+        # reading the sign or the obstacle -- and closed-loop the route is the
+        # centre of the lane the ego is already in, so a lateral offset decays
+        # as soon as it appears. "future" retargets the head to the ego's
+        # realised trajectory, making a held offset the thing the loss rewards.
+        self.path_target = str(os.environ.get(
+            "PATH_TARGET", self.cfg_train.get("path_target", "route")) or "route").lower()
+        if self.path_target not in ("route", "future"):
+            raise ValueError(
+                f"path_target must be 'route' or 'future', got {self.path_target!r}")
+        self.path_horizon = int(os.environ.get(
+            "PATH_HORIZON_FRAMES", self.cfg_train.get("path_horizon_frames", 40)) or 40)
+        # Frames a sample needs after the current one: the waypoints need
+        # wps_len*stride, the realised-future path needs enough travel to fill
+        # path_len metres at the 1 m spacing interpolate_route resamples to.
+        self.future_frames = self.cfg.model.waypoints.wps_len * self.wps_stride
+        if self.path_target == "future":
+            self.future_frames = max(self.future_frames, self.path_horizon)
+            print(f"[PlanTDataset] loss_path target = realised future over "
+                  f"{self.path_horizon} frames ({0.1 * self.path_horizon:.1f} s)")
+
+        # How far a PDD sign stays in the input. Must match the dump's
+        # PLANT2_SIGN_RADIUS_M: the tighter of the two wins, silently.
+        self.sign_radius = float(os.environ.get(
+            "PLANT2_SIGN_RADIUS_M", self.cfg_train.get("sign_radius", 120.0)) or 120.0)
 
         self.MAX_DISTANCE = self.cfg_train.range
         self.MAX_DISTANCE_DOUBLE = 2*self.MAX_DISTANCE
@@ -76,16 +144,22 @@ class PlanTDataset(Dataset):
         self.labels = []
         self.measurements = []
 
-        # If you're not using a slurm cluster you can use this line instead of the one after
-        label_raw_path_all = glob.glob(os.path.join(root, "**/boxes"), recursive=True)
-        # NOTE: FOR SLURM CHANGE TO:
-        # label_raw_path_all = subprocess.run(["lfs", "find", root, "-type", "d", "-name", "boxes", "--maxdepth", "3"], capture_output=True, text=True, check=True).stdout.splitlines()
+        # Fast route list when split is pre-filtered (avoids recursive NFS glob).
+        if not self.cfg_train.get("filter_routes", True):
+            root_path = Path(root)
+            label_raw_path = [
+                str(p)
+                for p in root_path.iterdir()
+                if p.is_dir() and (p / "boxes").is_dir()
+            ]
+        else:
+            # If you're not using a slurm cluster you can use this line instead of the one after
+            label_raw_path_all = glob.glob(os.path.join(root, "**/boxes"), recursive=True)
+            # NOTE: FOR SLURM CHANGE TO:
+            # label_raw_path_all = subprocess.run(["lfs", "find", root, "-type", "d", "-name", "boxes", "--maxdepth", "3"], capture_output=True, text=True, check=True).stdout.splitlines()
+            label_raw_path = [p[:-5] for p in label_raw_path_all]  # strip "/boxes"
 
-        label_raw_path_all = [p[:-5] for p in label_raw_path_all]
-
-        label_raw_path = label_raw_path_all # Could filter here if needed
-
-        logging.info(f"Found {len(label_raw_path)} results jsons.")
+        logging.info(f"Found {len(label_raw_path)} route dirs.")
 
         total_routes = 0
         skipped_routes = 0
@@ -144,14 +218,12 @@ class PlanTDataset(Dataset):
             # ignore the first 5 and last two frames
             for seq in range(
                 5,
-                num_seq - self.cfg.model.waypoints.wps_len - self.cfg_train.seq_len - 2,
+                num_seq - self.future_frames - self.cfg_train.seq_len - 2,
             ):
                 # load input seq and pred seq jointly
                 label = []
                 measurement = []
-                for idx in range(
-                    self.cfg_train.seq_len + self.cfg.model.waypoints.wps_len
-                ):
+                for idx in range(self.cfg_train.seq_len + self.future_frames):
                     labels_file = route_dir / "boxes" / f"{seq + idx:04d}.json.gz"
                     measurements_file = (
                         route_dir / "measurements" / f"{seq + idx:04d}.json.gz"
@@ -170,6 +242,58 @@ class PlanTDataset(Dataset):
         self.labels       = np.array(self.labels      ).astype(np.bytes_)
         self.measurements = np.array(self.measurements).astype(np.bytes_)
 
+        # Route → PDD sign_id (embedding index). Resolved once at init; attached
+        # on every __getitem__ without writing into diskcache.
+        split_meta = Path(root).resolve().parent.parent / "split_meta.json"
+        if not split_meta.is_file():
+            # root is .../train/data → parent.parent is split root
+            split_meta = Path(root).resolve().parent / "split_meta.json"
+        extra_map = load_split_meta_route2sign(split_meta)
+        uid2sign = load_uid2sign()
+        # merge uid map into extra for resolve_sign_id_for_route
+        for uid, sign in uid2sign.items():
+            extra_map.setdefault(uid, sign)
+            for var in ("default", "s1", "s2", "s3", "s4"):
+                extra_map.setdefault(f"{uid}_{var}", sign)
+
+        sign_ids = []
+        n_valued = 0
+        n_known = 0
+        n_sniffed = 0
+        for lab in self.labels:
+            label_path = lab[0].decode()
+            route_name = route_name_from_label_path(label_path)
+            route_dir = str(Path(label_path).parent.parent)
+            sid = resolve_sign_id_for_route(route_name, extra_map)
+            # A speed plate's number is not in its route name, so an id resolved
+            # by name alone cannot tell 3.24-at-20 from 3.24-at-40 — the two
+            # demand opposite speeds from the same token. Read it from the boxes.
+            code_by_name = sign_of_route_name(route_name)
+            if sid > 0 and code_by_name in SIGN_VALUE_CODES:
+                val = sniff_sign_value_from_route(route_dir)
+                if val is not None:
+                    sid = sign_code_to_id(code_by_name, val)
+                    n_valued += 1
+            if sid == 0:
+                # The name maps nothing, but the route's own boxes carry the
+                # code. Without this every 2.5 route in the mixture trains with
+                # sign_id=0 while 4.3 gets its real token — an asymmetry that
+                # silently invalidates any comparison between the two.
+                code = sniff_sign_from_route(route_dir)
+                sid = sign_code_to_id(code, sniff_sign_value_from_route(route_dir))
+                if sid > 0:
+                    n_sniffed += 1
+            if sid > 0:
+                n_known += 1
+            sign_ids.append(sid)
+        self.sample_sign_ids = np.asarray(sign_ids, dtype=np.int64)
+        self.sample_weights, self.frame_meta = self._load_frame_meta(root)
+        print(
+            f"sign_id resolve: {n_known}/{len(sign_ids)} samples mapped "
+            f"({n_sniffed} from boxes, {n_valued} with the plate value, "
+            f"split_meta={split_meta.is_file()})"
+        )
+
         print(f"Loading {len(self.labels)} samples")
         print('Total amount of routes:', total_routes)
         print('Skipped routes:', skipped_routes)
@@ -179,6 +303,115 @@ class PlanTDataset(Dataset):
         """Returns the length of the dataset."""
         return len(self.measurements)
 
+    def _load_frame_meta(self, root):
+        """Per-sample sampling weight + the metadata the sign metrics need.
+
+        Written by scripts/plant2_ft_pipeline/data/make_sample_weights.py. When
+        the file is absent every frame weighs 1 and the metrics see an empty
+        denominator -- exactly the behaviour before this existed.
+        """
+        n = len(self.labels)
+        weights = np.ones(n, dtype=np.float32)
+        meta = {
+            # Carried into the batch so the metrics can see which frames the
+            # sampler favoured without reaching back into the dataset.
+            "frame_weight": weights,
+            "in_zone": np.zeros(n, dtype=np.float32),
+            "plate_kmh": np.zeros(n, dtype=np.float32),
+            "detour_side": np.zeros(n, dtype=np.float32),
+            "cones_ahead": np.zeros(n, dtype=np.float32),
+        }
+        path = Path(root).parent / "sample_weights.json"
+        if not path.is_file():
+            print(f"sample weights: {path} absent -- uniform sampling, sign metrics idle")
+            return weights, meta
+
+        info = json.loads(path.read_text())
+        # 4.2.1 passes the obstacle on the right, 4.2.2 on the left
+        # (traffic_signs/detour_sign.py). Sign of the lateral offset, not a
+        # class id, so the metric can compare it against a waypoint directly.
+        side_num = {"right": 1.0, "left": -1.0}
+        sets = {name: (set(e.get("in_zone") or ()), set(e.get("cones") or ()))
+                for name, e in info.items()}
+
+        n_hot = n_zone = n_cones = 0
+        for i, lab in enumerate(self.labels):
+            label_path = Path(lab[0].decode())
+            route = label_path.parent.parent.name
+            entry = info.get(route)
+            if entry is None:
+                continue
+            seq = int(label_path.name.split(".")[0])
+            in_zone, cones = sets[route]
+
+            transient = entry.get("transient")
+            if transient and transient[0] <= seq <= transient[1]:
+                weights[i] = float(entry.get("w", 1.0))
+                n_hot += 1
+            if seq in in_zone:
+                meta["in_zone"][i] = 1.0
+                n_zone += 1
+            if seq in cones:
+                meta["cones_ahead"][i] = 1.0
+                n_cones += 1
+            plate = entry.get("plate")
+            if plate:
+                meta["plate_kmh"][i] = float(plate)
+            meta["detour_side"][i] = side_num.get(entry.get("side"), 0.0)
+
+        share = 100.0 * n_hot / max(1, n)
+        print(f"sample weights: {n_hot}/{n} frames upweighted ({share:.1f}% of the split), "
+              f"in_zone={n_zone} cones_ahead={n_cones}")
+        return weights, meta
+
+    def _attach_sign_id(self, sample, index: int):
+        """Shallow-copy and set sign_id without mutating diskcache entries."""
+        out = dict(sample)
+        out["sign_id"] = int(self.sample_sign_ids[index])
+        for key, arr in self.frame_meta.items():
+            out[key] = float(arr[index])
+        return out
+
+
+    def _cache_key(self, labels) -> str:
+        """Cache key. The stride changes the waypoints stored in a sample and
+        the lookahead mode changes target_speed, so both must be part of the
+        key — otherwise a cache filled under one mode silently serves its
+        targets to a run using the other."""
+        key = labels[0].decode()
+        if self.wps_stride != 1:
+            key = f"{key}|s{self.wps_stride}"
+        if self.ts_lookahead:
+            key = f"{key}|la"
+        if self.path_target != "route":
+            key = f"{key}|pf{self.path_horizon}"
+        return key
+
+    def _future_path(self, loaded_measurements):
+        """The ego's realised future in the current ego frame, arc-length
+        resampled the same way the route target is, so pred_path keeps its
+        geometric meaning while no longer being a copy of its own input token.
+
+        build_ego_matrix writes LOCAL as (x-forward, y-left), the convention the
+        dump flips the route into, so the two targets are directly comparable.
+        When the expert travels less than the path length -- slow frames, the
+        end of an episode -- the trajectory is extended along its final heading
+        rather than clamped, which would otherwise collapse the tail of the
+        target onto one point and teach the head to plan a stop.
+        """
+        i0 = self.cfg_train.seq_len - 1
+        mats = np.asarray([m["ego_matrix"] for m in loaded_measurements[i0:]],
+                          dtype=np.float64)
+        pts = (np.linalg.inv(mats[0]) @ mats[:, :, 3].T).T[:, :2]
+        path_len = int(self.cfg.model.waypoints.path_len)
+        travelled = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+        if travelled < path_len + 1.0 and len(pts) > 2:
+            step = pts[-1] - pts[-2]
+            norm = float(np.linalg.norm(step))
+            if norm > 1e-6:
+                pts = np.vstack(
+                    [pts, pts[-1] + step / norm * (path_len + 1.0 - travelled)])
+        return interpolate_route(pts[1:])
 
     def add_parked_cars(self, sample):
         if self.cfg_train.augment_parked:
@@ -210,49 +443,80 @@ class PlanTDataset(Dataset):
 
         # See if we can use the cache
         if augment and self.data_cache is not None:
-            if labels[0].decode()+"_aug" in self.data_cache:
-                sample = self.data_cache[labels[0].decode()+"_aug"]
-                return sample
+            if self._cache_key(labels) + "_aug" in self.data_cache:
+                sample = self.data_cache[self._cache_key(labels) + "_aug"]
+                return self._attach_sign_id(sample, index)
 
-            elif labels[0].decode() in self.data_cache:
-                sample = self.transform(self.data_cache[labels[0].decode()])
+            elif self._cache_key(labels) in self.data_cache:
+                sample = self.transform(self.data_cache[self._cache_key(labels)])
                 sample.pop("BEV_aug", None)
                 sample.pop("output_floating", None)
-                self.data_cache[labels[0].decode()+"_aug"] = sample
-                return sample
+                self.data_cache[self._cache_key(labels) + "_aug"] = sample
+                return self._attach_sign_id(sample, index)
 
-        elif self.data_cache is not None and labels[0].decode() in self.data_cache:
-                sample = self.data_cache[labels[0].decode()]
+        elif self.data_cache is not None and self._cache_key(labels) in self.data_cache:
+                sample = self.data_cache[self._cache_key(labels)]
                 sample.pop("BEV_aug", None)
                 sample.pop("output_floating", None)
-                return sample
+                return self._attach_sign_id(sample, index)
 
         # Load new sample
         loaded_labels = []
         loaded_measurements = []
 
-        for i in range(self.cfg_train.seq_len + self.cfg.model.waypoints.wps_len):
-            measurements_i = json.load(gzip.open(measurements[i]))
-            labels_i = json.load(gzip.open(labels[i]))
-
-            loaded_labels.append(labels_i)
-            loaded_measurements.append(measurements_i)
+        # Measurements are needed across the whole future window: the stride
+        # slice would otherwise yield wps_len/stride waypoints and crash the L1
+        # loss on shape mismatch, and the realised-future path needs the frames
+        # beyond that. Boxes are read only at the current frame and at the
+        # forecasting offset (+1), so loading the rest is pure I/O.
+        n_meas = min(len(measurements), self.cfg_train.seq_len + self.future_frames)
+        n_lab = min(len(labels), self.cfg_train.seq_len + 1)
+        for i in range(n_meas):
+            loaded_measurements.append(json.load(gzip.open(measurements[i])))
+        for i in range(n_lab):
+            loaded_labels.append(json.load(gzip.open(labels[i])))
 
         # Extract ego waypoints
         matrices = [x["ego_matrix"] for x in loaded_measurements[self.cfg_train.seq_len - 1 :]]
         ego_inv = np.linalg.inv(matrices[0])
-        points = np.array(matrices[1:])[:,:,3]
+        wps_len = self.cfg.model.waypoints.wps_len
+        points = np.array(matrices[self.wps_stride::self.wps_stride][:wps_len])[:, :, 3]
         points = (ego_inv @ points.T).T[:,:2].tolist()
         sample["waypoints"] = points
 
         sample["route_original"] = loaded_measurements[self.cfg_train.seq_len - 1]["route_original"][:20]
-        sample["route"] = interpolate_route(loaded_measurements[self.cfg_train.seq_len - 1]["route"][:20])
+        if self.path_target == "future":
+            sample["route"] = self._future_path(loaded_measurements)
+        else:
+            sample["route"] = interpolate_route(
+                loaded_measurements[self.cfg_train.seq_len - 1]["route"][:20])
 
-        sample["target_speed"] = loaded_measurements[self.cfg_train.seq_len - 1]["target_speed"]
-        sample["ego_speed"] = loaded_measurements[self.cfg_train.seq_len - 1]["speed"]
+        meas_t = loaded_measurements[self.cfg_train.seq_len - 1]
+        sample["target_speed"] = meas_t["target_speed"]
+        # Prefer explicit dump field; fall back to legacy ``speed``.
+        sample["ego_speed"] = meas_t["ego_speed"] if "ego_speed" in meas_t else meas_t["speed"]
+
+        if self.ts_lookahead:
+            # Commanded-style label: the minimum ego speed over the loaded
+            # future window. A frame 1-2 s before a stop is labelled 0 while
+            # the car still moves — matching what upstream autopilot dumps —
+            # and, unlike the instantaneous speed, it is predictable from the
+            # sign geometry and traffic visible in the frame. Speeds under the
+            # dump's brake epsilon collapse to an exact 0.0 so the two-hot
+            # encoding puts full mass on bin 0. Only meaningful for routes
+            # whose label is the ego speed (priority signs); do not enable for
+            # posted-limit routes, where target_speed is the constant limit.
+            future = loaded_measurements[self.cfg_train.seq_len - 1:]
+            v = min(float(m["ego_speed"] if "ego_speed" in m else m["speed"])
+                    for m in future)
+            sample["target_speed"] = 0.0 if v < 0.5 else v
 
         speed_limit = loaded_measurements[self.cfg_train.seq_len - 1]["speed_limit"]
-        speed_limit = round(speed_limit*3.6) # TODO
+        speed_limit = round(speed_limit * 3.6)  # TODO
+        # Map unknown PDD limits (20/40/60/...) to nearest known embedding bin.
+        if speed_limit not in self.speed_cats:
+            known = sorted(self.speed_cats.keys())
+            speed_limit = min(known, key=lambda k: abs(k - speed_limit))
         sample["speed_limit"] = self.speed_cats[speed_limit]
 
         if loaded_measurements[self.cfg_train.seq_len - 1]["brake"]: # Just in case
@@ -287,13 +551,26 @@ class PlanTDataset(Dataset):
         sample["ego_pos"] = measurements_data["pos_global"]
         sample["ego_rot"] = ego_yaw
 
+        # Spatial PDD signs dumped as boxes["class"] == "2.1" / "3.24" / ...
+        pdd_classes = set(SIGN_CODES)
+        sign_like = {"stop_sign"} | pdd_classes
+
         # Fix static extents and drop irrelevant objects
         for x in labels_data:
             if "position" in x:
                 pos_x, pos_y, pos_z = x["position"]
 
-                # 30m radius for tl and stop
-                if x["class"] in ["traffic_light", "stop_sign"]:
+                # A traffic light or a CARLA stop sign matters within 30 m —
+                # its rule bites at a point. A PDD sign governs a zone that runs
+                # 103 m at the median, and with seq_len=1 there is no memory to
+                # carry it, so the sign itself has to stay in frame: the dump
+                # writes it out to PLANT2_SIGN_RADIUS_M and this must not throw
+                # it away again. The radius was hardcoded in both places, so
+                # widening it in the dump alone changed nothing.
+                if x["class"] in pdd_classes:
+                    if pos_x**2 + pos_y**2 > self.sign_radius**2 or abs(pos_z) > 30:
+                        x["class"] = "too far"
+                elif x["class"] in (["traffic_light", "stop_sign"]):
                     if pos_x**2 + pos_y**2 > 30**2 or abs(pos_z) > 30:
                         x["class"] = "too far"
                 # ellipse for others
@@ -345,19 +622,38 @@ class PlanTDataset(Dataset):
                 if x["class"].lower() in self.car_types
             ]
 
-        # Add static cars, static objects, traffic lights, stop signs
+        # Add static cars, static objects, traffic lights, stop / PDD signs
+        def _keep_staticish(x) -> bool:
+            cls = x["class"].lower() if isinstance(x["class"], str) else x["class"]
+            # PDD codes are numeric strings ("2.1"); keep original key for type_nums.
+            cls_key = x["class"] if x["class"] in self.type_nums else cls
+            if cls_key in self.car_types:
+                return False
+            if cls_key not in self.type_nums:
+                return False
+            if cls == "traffic_light":
+                return x.get("state") in ["Red", "Yellow"] and x.get("affects_ego")
+            if cls_key in sign_like or cls in sign_like:
+                return bool(x.get("affects_ego"))
+            return True
+
         input_objects += [[
-                self.type_nums[x["class"].lower()], # type indicator
+                self.type_nums[x["class"] if x["class"] in self.type_nums else x["class"].lower()],
                 x["position"][0],
                 x["position"][1],
                 rad2deg(x["yaw"]),  # in degrees
-                0.0,
+                # Static objects do not move, so this slot was a constant 0.
+                # Speed-limit plates (3.24 / 5.31 / 4.6) now carry the number
+                # written on them here, in km/h: it is the only channel that
+                # tells 20 from 60 apart, since both share one PDD class.
+                # Everything else still dumps speed 0 and is unaffected.
+                x.get("speed", 0.0) * 3.6,
                 x["extent"][1]*2,
                 x["extent"][0]*2,
-                -1 if x["class"].lower() != "static_car" else -999, #-1 is for all the static objects, -999 denotes static cars, which dont have an id
+                -1 if (x["class"] if x["class"] in self.type_nums else x["class"].lower()) != "static_car" else -999,
             ]
             for x in labels_data
-            if x["class"].lower() not in self.car_types and x["class"].lower() in self.type_nums.keys() and (x["class"].lower()!="traffic_light" or (x["state"] in ["Red", "Yellow"] and x["affects_ego"])) and (x["class"]!="stop_sign" or x["affects_ego"])
+            if _keep_staticish(x)
         ]
 
         # Load output (forecasting) objects
@@ -421,24 +717,24 @@ class PlanTDataset(Dataset):
 
         # Store in data cache
         if self.data_cache is not None:
-            self.data_cache[labels[0].decode()] = sample # Save unaugmented sample with BEV_aug so we can use it later for aug
+            self.data_cache[self._cache_key(labels)] = sample # Save unaugmented sample with BEV_aug so we can use it later for aug
 
         if augment:
             sample = self.transform(sample)
             if self.data_cache is not None:
                 sample.pop("BEV_aug", None) # Augmented sample doesnt need BEV_aug since its the normal BEV
                 sample.pop("output_floating", None)
-                self.data_cache[labels[0].decode()+"_aug"] = sample
+                self.data_cache[self._cache_key(labels) + "_aug"] = sample
 
         sample.pop("BEV_aug", None)
         sample.pop("output_floating", None)
 
-        return sample
-    
+        return self._attach_sign_id(sample, index)
+
     def aug_sample(self, sample):
-        # In transfuser, translation gets subtracted and applied first
+        # Geometric augment using recorded augmentation_translation / rotation.
+        # Translation applied first (transfuser convention).
         translate = - np.array([0.0, sample["augmentation_translation"]])
-        # In transfuser multiplizieren die R von links und transposen beides?
         rot = np.deg2rad(sample["augmentation_rotation"])
 
         if self.cfg_train.get("input_bev", False):
@@ -613,7 +909,7 @@ def generate_batch(data_batch):
         y_batch_objs.extend(sample["output"])
 
         for key in keys:
-            if key == "speed_limit":
+            if key == "speed_limit" or key == "sign_id":
                 batches[key].append(torch.tensor(sample[key], dtype=torch.int))
             else:
                 if torch.is_tensor(sample[key]):
