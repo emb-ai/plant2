@@ -260,29 +260,48 @@ class PlanTDataset(Dataset):
         n_valued = 0
         n_known = 0
         n_sniffed = 0
+        route_cache: dict = {}
+
+        def _resolve_route(route_name: str, route_dir: str):
+            """(sign_id, how) for one route, with the plate value applied.
+
+            The plate number is in neither the route name nor split_meta, which
+            stores the bare code. Resolving by name first therefore gave train
+            and val two different tokens for the same sign: a train route, absent
+            from split_meta, fell through to the boxes and got "3.24@40", while
+            the same sign in val resolved from split_meta as plain "3.24". The
+            head then fitted the train tokens and met unseen ones at every
+            validation step -- train CE at the two-hot floor, val CE at chance,
+            and nothing in the logs naming the cause. The boxes are the only
+            source that carries the number, so they decide whenever the code can
+            carry one.
+            """
+            code_in_boxes = sniff_sign_from_route(route_dir)
+            if code_in_boxes in SIGN_VALUE_CODES:
+                val = sniff_sign_value_from_route(route_dir)
+                if val is not None:
+                    return sign_code_to_id(code_in_boxes, val), "valued"
+            sid = resolve_sign_id_for_route(route_name, extra_map)
+            if sid > 0:
+                return sid, "name"
+            if code_in_boxes:
+                sid = sign_code_to_id(code_in_boxes,
+                                      sniff_sign_value_from_route(route_dir))
+                if sid > 0:
+                    return sid, "boxes"
+            return 0, "none"
+
         for lab in self.labels:
             label_path = lab[0].decode()
             route_name = route_name_from_label_path(label_path)
             route_dir = str(Path(label_path).parent.parent)
-            sid = resolve_sign_id_for_route(route_name, extra_map)
-            # A speed plate's number is not in its route name, so an id resolved
-            # by name alone cannot tell 3.24-at-20 from 3.24-at-40 — the two
-            # demand opposite speeds from the same token. Read it from the boxes.
-            code_by_name = sign_of_route_name(route_name)
-            if sid > 0 and code_by_name in SIGN_VALUE_CODES:
-                val = sniff_sign_value_from_route(route_dir)
-                if val is not None:
-                    sid = sign_code_to_id(code_by_name, val)
-                    n_valued += 1
-            if sid == 0:
-                # The name maps nothing, but the route's own boxes carry the
-                # code. Without this every 2.5 route in the mixture trains with
-                # sign_id=0 while 4.3 gets its real token — an asymmetry that
-                # silently invalidates any comparison between the two.
-                code = sniff_sign_from_route(route_dir)
-                sid = sign_code_to_id(code, sniff_sign_value_from_route(route_dir))
-                if sid > 0:
-                    n_sniffed += 1
+            if route_dir not in route_cache:
+                route_cache[route_dir] = _resolve_route(route_name, route_dir)
+            sid, how = route_cache[route_dir]
+            if how == "valued":
+                n_valued += 1
+            elif how == "boxes":
+                n_sniffed += 1
             if sid > 0:
                 n_known += 1
             sign_ids.append(sid)
