@@ -16,6 +16,8 @@ import glob
 from plant_variables import PlanTVariables
 from util.static_extents import CAR_EXTENTS, STATIC_EXTENTS
 from util.sign_id import (
+    MIN_SPEED_CODES,
+    base_sign_code,
     SIGN_VALUE_CODES,
     sign_of_route_name,
     sniff_sign_value_from_route,
@@ -526,8 +528,17 @@ class PlanTDataset(Dataset):
             # whose label is the ego speed (priority signs); do not enable for
             # posted-limit routes, where target_speed is the constant limit.
             future = loaded_measurements[self.cfg_train.seq_len - 1:]
-            v = min(float(m["ego_speed"] if "ego_speed" in m else m["speed"])
-                    for m in future)
+            speeds = [float(m["ego_speed"] if "ego_speed" in m else m["speed"])
+                      for m in future]
+            # The minimum encodes a margin BELOW what the expert drove, which is
+            # what a ceiling plate (3.24 / 5.31 / 5.21) needs: labelling the
+            # posted number itself made the model sit on the limit and violate
+            # about half the in-zone steps. A floor plate (4.6) demands the
+            # mirror image -- taking the minimum there points the margin at the
+            # violation, and its compliance stayed at 0.231 while the ceiling
+            # signs reached 0.95-1.00 on the same run.
+            code = base_sign_code(int(self.sample_sign_ids[index]))
+            v = max(speeds) if code in MIN_SPEED_CODES else min(speeds)
             sample["target_speed"] = 0.0 if v < 0.5 else v
 
         speed_limit = loaded_measurements[self.cfg_train.seq_len - 1]["speed_limit"]

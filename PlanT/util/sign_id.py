@@ -68,6 +68,22 @@ SIGN_ID_VOCAB: tuple[str, ...] = SIGN_CODES + tuple(
 SIGN_CATS: dict[str, int] = {code: i + 1 for i, code in enumerate(SIGN_ID_VOCAB)}
 NUM_SIGN_CLASSES: int = 1 + len(SIGN_ID_VOCAB)
 
+# Plates that prescribe a floor rather than a ceiling: the driver must stay
+# ABOVE the number. Every other speed plate is a ceiling, and the two demand
+# opposite margins from the same kind of label.
+MIN_SPEED_CODES: tuple[str, ...] = ("4.6",)
+
+
+def base_sign_code(sign_id: int) -> Optional[str]:
+    """The plain code behind an embedding index, without the plate value."""
+    try:
+        idx = int(sign_id)
+    except (TypeError, ValueError):
+        return None
+    if idx <= 0 or idx > len(SIGN_ID_VOCAB):
+        return None
+    return SIGN_ID_VOCAB[idx - 1].split("@", 1)[0]
+
 _EXPERTS_ROOT = Path("/home/jovyan/shares/SR006.nfs3/shepelev/collected_trajectories")
 _EXPERT_JSONLS = (
     _EXPERTS_ROOT / "traj-priority-signs/traj_yield_2_4_train80/experts/experts_scene_uid_top1.jsonl",
