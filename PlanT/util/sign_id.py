@@ -5,6 +5,7 @@ Index 0 is reserved for unknown / missing. Does not read boxes or mutate cache.
 from __future__ import annotations
 
 import json
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -84,16 +85,6 @@ def base_sign_code(sign_id: int) -> Optional[str]:
         return None
     return SIGN_ID_VOCAB[idx - 1].split("@", 1)[0]
 
-_EXPERTS_ROOT = Path("/home/jovyan/shares/SR006.nfs3/shepelev/collected_trajectories")
-_EXPERT_JSONLS = (
-    _EXPERTS_ROOT / "traj-priority-signs/traj_yield_2_4_train80/experts/experts_scene_uid_top1.jsonl",
-    _EXPERTS_ROOT / "traj-priority-signs/traj_stop_2_5_train80/experts/experts_scene_uid_top1.jsonl",
-    _EXPERTS_ROOT / "traj-priority-signs/traj_main_2_1_train80/experts/experts_scene_uid_top1.jsonl",
-    _EXPERTS_ROOT / "traj-priority-signs/traj_secondary_2_3_train80/experts/experts_scene_uid_top1.jsonl",
-    _EXPERTS_ROOT / "traj-priority-signs/traj_roundabout_4_3_train80/experts/experts_scene_uid_top1.jsonl",
-    _EXPERTS_ROOT / "traffic-rule-bench-traj/experts_detour_train80/experts_scene_uid_top1.jsonl",
-    _EXPERTS_ROOT / "traj-priority-signs/traj_lane_5_15_train80/experts/experts_scene_uid_top1.jsonl",
-)
 
 _SUMO_SIGN_RE = re.compile(
     r"sumo_(2\.1|2\.3\.[123]|2\.4|2\.5|3\.1|3\.2|3\.24|4\.2\.[123]|4\.3|4\.6|"
@@ -126,10 +117,28 @@ def sign_of_route_name(name: str) -> Optional[str]:
     return None
 
 
+def _expert_jsonls() -> tuple[Path, ...]:
+    """Expert lists of a collection run: ORACLE_ROOT/<family>/experts/*_top1.jsonl.
+
+    This was a fixed tuple of absolute paths under one person's cluster share:
+    on any other machine every file simply failed `is_file()` and the mapping
+    came back empty, with nothing said about it.
+    """
+    raw = os.environ.get("ORACLE_ROOT", "").strip()
+    if not raw:
+        return ()
+    out: list[Path] = []
+    for root in raw.split(";"):
+        root = root.strip()
+        if root:
+            out.extend(sorted(Path(root).glob("*/experts/experts_scene_uid_top1.jsonl")))
+    return tuple(out)
+
+
 @lru_cache(maxsize=1)
 def load_uid2sign() -> dict[str, str]:
     mapping: dict[str, str] = {}
-    for path in _EXPERT_JSONLS:
+    for path in _expert_jsonls():
         if not path.is_file():
             continue
         with path.open() as f:
