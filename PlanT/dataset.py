@@ -538,7 +538,13 @@ class PlanTDataset(Dataset):
             # violation, and its compliance stayed at 0.231 while the ceiling
             # signs reached 0.95-1.00 on the same run.
             code = base_sign_code(int(self.sample_sign_ids[index]))
-            v = max(speeds) if code in MIN_SPEED_CODES else min(speeds)
+            # The window maximum was the obvious mirror, but it raises the whole
+            # speed head: with it 4.6 went 0.231 -> 0.346 while the three ceiling
+            # plates fell 0.96/0.96/0.99 -> 0.85/0.72/0.89 on the same run, for a
+            # worse total. The expert's own speed already satisfies the floor
+            # (measured: 0 violating steps in 4405 in-zone frames under the sign's
+            # real rule), so imitating it needs no margin in either direction.
+            v = speeds[0] if code in MIN_SPEED_CODES else min(speeds)
             sample["target_speed"] = 0.0 if v < 0.5 else v
 
         speed_limit = loaded_measurements[self.cfg_train.seq_len - 1]["speed_limit"]
