@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 # Codes used in plant2_l1_fv_experts_split (+ common eval signs).
-SIGN_CODES: tuple[str, ...] = (
+_LEGACY_SIGN_CODES: tuple[str, ...] = (
     "2.1",
     "2.3.1",
     "2.3.2",
@@ -35,6 +35,26 @@ SIGN_CODES: tuple[str, ...] = (
     "5.21",
     "5.31",
 )
+
+# Codes added after checkpoints were already trained on the vocabulary above.
+# They are appended at the END of SIGN_ID_VOCAB, not merged into the tuple, so
+# every id a trained sign_emb already holds keeps its number and the matrix only
+# grows. Merging them in would renumber "3.24@20" and every other valued entry,
+# silently repointing an existing checkpoint's embedding rows at other signs.
+_ADDED_SIGN_CODES: tuple[str, ...] = (
+    "3.18.1",
+    "3.18.2",
+    "4.1.1",
+    "4.1.2",
+    "4.1.3",
+    "4.1.4",
+    "4.1.5",
+    "4.1.6",
+)
+
+# Box-token classes: appending here is safe because class_nums enumerates this
+# tuple and the legacy positions do not move.
+SIGN_CODES: tuple[str, ...] = _LEGACY_SIGN_CODES + _ADDED_SIGN_CODES
 
 # Plates that carry a number, and the numbers they can carry (km/h). The code
 # alone cannot say WHICH limit applies: 3.24 at 20 and 3.24 at 40 demand
@@ -60,9 +80,13 @@ def qualified_sign_code(code: Optional[str], value_kmh=None) -> Optional[str]:
     return f"{code}@{v}"
 
 
-# The id vocabulary: every plain code, then one entry per (valued code, value).
-SIGN_ID_VOCAB: tuple[str, ...] = SIGN_CODES + tuple(
-    f"{c}@{v}" for c in SIGN_VALUE_CODES for v in SIGN_VALUES_KMH
+# The id vocabulary: the original plain codes, then one entry per (valued code,
+# value), then the codes added later. The order is load-bearing -- see
+# _ADDED_SIGN_CODES.
+SIGN_ID_VOCAB: tuple[str, ...] = (
+    _LEGACY_SIGN_CODES
+    + tuple(f"{c}@{v}" for c in SIGN_VALUE_CODES for v in SIGN_VALUES_KMH)
+    + _ADDED_SIGN_CODES
 )
 
 # 0 = unknown; 1..N = SIGN_ID_VOCAB
@@ -87,7 +111,8 @@ def base_sign_code(sign_id: int) -> Optional[str]:
 
 
 _SUMO_SIGN_RE = re.compile(
-    r"sumo_(2\.1|2\.3\.[123]|2\.4|2\.5|3\.1|3\.2|3\.24|4\.2\.[123]|4\.3|4\.6|"
+    r"sumo_(2\.1|2\.3\.[123]|2\.4|2\.5|3\.1|3\.2|3\.18\.[12]|3\.24|"
+    r"4\.1\.[123456]|4\.2\.[123]|4\.3|4\.6|"
     r"5\.7\.[12]|5\.15\.[12]|5\.19|5\.21|5\.31)_"
 )
 
