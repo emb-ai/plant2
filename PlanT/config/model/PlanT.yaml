@@ -11,6 +11,9 @@ waypoints:
   path_weight: 5
   wps_weight: 1
   speed_weight: 1
+  # H2-detour: per-sample path-loss multiplier = 1 + alpha * max(|path_y|).
+  # 0 = disabled (exact prior uniform-mean L1 behaviour).
+  lateral_reweight_alpha: 0.0
 
   gru_hidden_size: 64
 
@@ -20,6 +23,20 @@ training:
   input_ego_speed: False
   input_bev: True
   input_static_cars: True
+  # H5-detour: duplicate frames with a cone within this many meters (ego
+  # frame), oversample_factor times. 0 = disabled.
+  oversample_cone_distance_min_m: 0.0
+  oversample_cone_distance_m: 0.0
+  # Same window measured to the SIGN. Needed where the obstacle is rarely in
+  # frame: on the oracle detour scenes a cone is visible in 4% of frames, a
+  # sign in 87%.
+  oversample_sign_distance_min_m: 0.0
+  oversample_sign_distance_m: 0.0
+  oversample_factor: 1
+  # H6/H7-detour: break the route-copying shortcut (see model.py
+  # _perturb_route). Training-time only. 0.0 = disabled.
+  route_dropout_p: 0.0
+  route_lateral_noise_m: 0.0
 
   max_epochs: 30
   batch_size: 128
@@ -41,6 +58,26 @@ training:
   # Override via model.training.speed_class_weights=[15,15,10,1.0,1.0,1.0,1.0,1.0,1.0,1.0]
   # or env SPEED_CLASS_WEIGHTS=15,1,1,1,1,1,1,1
   speed_class_weights: [15, 15, 10, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+  # --- Sign-compliance hypotheses (2.5 stop-sign FT experiments) ---
+  # H1: keep in-range PDD/stop-sign x_objs regardless of the simulator's
+  # affects_ego flag (which can flicker frame-to-frame). Default False keeps
+  # the original filtering behaviour.
+  sign_ignore_affects_ego: False
+  # H1: detection radius (m) for TL/stop/PDD sign x_objs objects (default 30
+  # matches original hardcoded behaviour).
+  sign_range_m: 30
+  # H3: extra scalar input token = decayed "sign seen in the last K frames"
+  # (dataset.py PlanTDataset._recent_sign_signal). 0 = disabled.
+  sign_memory_frames: 0
+  # H4: auxiliary BCE loss weight for a probe predicting whether a relevant
+  # sign is present in x_objs this frame (model.py sign_presence_head). 0 =
+  # disabled (no head constructed, no loss term added).
+  aux_sign_presence_weight: 0.0
+  # H5: pool current-frame sign-like object embeddings into one dedicated
+  # global conditioning token (model.py forward()), perception-derived
+  # (unlike the removed metadata-injected sign_id/sign_emb).
+  sign_pool_token: False
 
 pre_training:
   forecastLoss_weight: 1

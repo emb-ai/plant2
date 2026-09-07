@@ -166,9 +166,12 @@ class PlanTDataset(Dataset):
                     label.append(labels_file)
                     measurement.append(measurements_file)
 
-                self.BEV.append(route_dir / "bev_no_car_semantics" / f"{seq + self.cfg_train.seq_len-1:04d}.png")
-                self.labels.append(label)
-                self.measurements.append(measurement)
+                bev_path = route_dir / "bev_no_car_semantics" / f"{seq + self.cfg_train.seq_len-1:04d}.png"
+                repeat = self._oversample_repeat(label[self.cfg_train.seq_len - 1])
+                for _ in range(repeat):
+                    self.BEV.append(bev_path)
+                    self.labels.append(label)
+                    self.measurements.append(measurement)
 
         # There is a complex "memory leak"/performance issue when using Python objects like lists in a Dataloader that is loaded with multiprocessing, num_workers > 0
         # A summary of that ongoing discussion can be found here https://github.com/pytorch/pytorch/issues/13246#issuecomment-905703662
@@ -181,6 +184,72 @@ class PlanTDataset(Dataset):
         print('Total amount of routes:', total_routes)
         print('Skipped routes:', skipped_routes)
         print('Trainable routes:', trainable_routes)
+
+    def _oversample_repeat(self, labels_file) -> int:
+        """H5-detour: how many times to duplicate this frame in the dataset.
+
+        Obstacle-avoidance is a handful of frames per route needing a real
+        lateral swerve, drowned out by the rest of the route's near-straight
+        frames -- loss reweighting alone plateaus under Adam's per-parameter
+        gradient normalization (scaling one sample's loss doesn't scale the
+        actual step size nearly that much, since the running gradient-
+        magnitude estimate for the same parameters adapts alongside it).
+        Oversampling changes how often the pattern is seen at all, which
+        loss-scaling can't replicate.
+
+        Uses the frame's own ``boxes/*.json.gz`` (ego-frame object list,
+        cones are ``class=='static', type_id=='static.prop.constructioncone'``)
+        rather than the ground-truth path's lateral extent -- a first
+        attempt at the latter found ~59% of ALL frames exceed 0.5m lateral
+        deviation (ordinary turns/junctions have similar magnitude to an
+        obstacle swerve in this representation), so it can't distinguish
+        "near an obstacle" from "route has a bend in it". Cone proximity is
+        unambiguous.
+
+        Distances form a WINDOW ``[oversample_cone_distance_min_m,
+        oversample_cone_distance_m]``. The window matters: the expert starts
+        its lane change a median 51.5 m before the cone (77% of routes finish
+        it before the 30 m compliance zone even begins), so the frames that
+        actually teach the *decision* are the far ones. An earlier run
+        oversampled `<=5 m` -- frames where the maneuver is already over --
+        and unsurprisingly changed nothing.
+
+        ``oversample_cone_distance_m`` (default 0 disabled) /
+        ``oversample_factor`` (default 1, no duplication even if a distance is
+        set) gate this.
+        """
+        factor = int(self.cfg_train.get("oversample_factor", 1))
+        if factor <= 1:
+            return 1
+
+        cone_max = float(self.cfg_train.get("oversample_cone_distance_m", 0.0))
+        cone_min = float(self.cfg_train.get("oversample_cone_distance_min_m", 0.0))
+        # Same window, but measured to the SIGN rather than to a cone. On scene
+        # sets where the obstacle is rarely in frame the cone rule is inert --
+        # measured on the oracle detour dump, a cone is visible in 4% of frames
+        # against 69% on the older one, so cone-keyed oversampling touched 725
+        # frames instead of 42050. The sign is present in 87% of those frames,
+        # and it is what the decision is actually made on.
+        sign_max = float(self.cfg_train.get("oversample_sign_distance_m", 0.0))
+        sign_min = float(self.cfg_train.get("oversample_sign_distance_min_m", 0.0))
+        if cone_max <= 0.0 and sign_max <= 0.0:
+            return 1
+
+        with gzip.open(labels_file, "rt", encoding="utf-8") as f:
+            boxes = json.load(f)
+        sign_like = set(SIGN_CODES)
+        for obj in boxes:
+            if not isinstance(obj, dict) or "position" not in obj:
+                continue
+            x, y = obj["position"][0], obj["position"][1]
+            d = (x * x + y * y) ** 0.5
+            if cone_max > 0.0 and obj.get("type_id") == "static.prop.constructioncone":
+                if cone_min <= d <= cone_max:
+                    return factor
+            if sign_max > 0.0 and obj.get("class") in sign_like:
+                if sign_min <= d <= sign_max:
+                    return factor
+        return 1
 
     def __len__(self) -> int:
         """Returns the length of the dataset."""
@@ -202,6 +271,41 @@ class PlanTDataset(Dataset):
             del sample["parked_cars"]
             del sample["parked_cars_quant"]
 
+    @staticmethod
+    def _sign_in_range(objs, sign_like, sign_range) -> bool:
+        for x in objs:
+            cls = x.get("class")
+            cls_l = cls.lower() if isinstance(cls, str) else cls
+            if cls not in sign_like and cls_l not in sign_like:
+                continue
+            if not x.get("affects_ego") or "position" not in x:
+                continue
+            pos_x, pos_y, pos_z = x["position"]
+            if pos_x**2 + pos_y**2 <= sign_range**2 and abs(pos_z) <= 30:
+                return True
+        return False
+
+    def _recent_sign_signal(self, cur_boxes_path, cur_labels_data, sign_like, sign_range, lookback) -> float:
+        """H3: 1.0 if a relevant sign is in-frame now; else linearly-decayed
+        value based on how many frames ago it was last seen (0 beyond lookback)."""
+        if self._sign_in_range(cur_labels_data, sign_like, sign_range):
+            return 1.0
+
+        boxes_path = Path(cur_boxes_path)
+        boxes_dir = boxes_path.parent
+        seq = int(boxes_path.name.split(".")[0])
+        for back in range(1, lookback + 1):
+            prev_seq = seq - back
+            if prev_seq < 0:
+                break
+            prev_path = boxes_dir / f"{prev_seq:04d}.json.gz"
+            if not prev_path.is_file():
+                break
+            prev_boxes = json.load(gzip.open(prev_path))[1:]  # drop ego
+            if self._sign_in_range(prev_boxes, sign_like, sign_range):
+                return max(0.0, 1.0 - back / lookback)
+        return 0.0
+
     def __getitem__(self, index):
         """Returns the item at index idx."""
 
@@ -214,24 +318,38 @@ class PlanTDataset(Dataset):
 
         augment = self.transform is not None and np.random.rand() < self.aug_rate
 
-        # See if we can use the cache
-        if augment and self.data_cache is not None:
-            if labels[0].decode()+"_aug" in self.data_cache:
-                sample = self.data_cache[labels[0].decode()+"_aug"]
-                return sample
+        # See if we can use the cache.
+        #
+        # Uses the atomic Cache.get() rather than `key in cache` followed by
+        # `cache[key]`. That check-then-read pattern is a TOCTOU race: when
+        # several trainings share one diskcache sitting at its size limit,
+        # another process can evict the key between the two calls, and the
+        # read then raises KeyError inside a DataLoader worker and kills the
+        # run mid-epoch (observed doing exactly that). get() returns None on a
+        # miss instead, and we simply fall through and reload from disk.
+        # NB: never assign to `sample` here -- it is already initialised to the
+        # dict built above, and the load-from-disk path below fills that dict
+        # in place. Binding a cache miss (None) to it breaks that fallthrough.
+        if self.data_cache is not None:
+            cache_key = labels[0].decode()
+            if augment:
+                cached_aug = self.data_cache.get(cache_key + "_aug")
+                if cached_aug is not None:
+                    return cached_aug
 
-            elif labels[0].decode() in self.data_cache:
-                sample = self.transform(self.data_cache[labels[0].decode()])
-                sample.pop("BEV_aug", None)
-                sample.pop("output_floating", None)
-                self.data_cache[labels[0].decode()+"_aug"] = sample
-                return sample
-
-        elif self.data_cache is not None and labels[0].decode() in self.data_cache:
-                sample = self.data_cache[labels[0].decode()]
-                sample.pop("BEV_aug", None)
-                sample.pop("output_floating", None)
-                return sample
+                cached = self.data_cache.get(cache_key)
+                if cached is not None:
+                    transformed = self.transform(cached)
+                    transformed.pop("BEV_aug", None)
+                    transformed.pop("output_floating", None)
+                    self.data_cache[cache_key + "_aug"] = transformed
+                    return transformed
+            else:
+                cached = self.data_cache.get(cache_key)
+                if cached is not None:
+                    cached.pop("BEV_aug", None)
+                    cached.pop("output_floating", None)
+                    return cached
 
         # Load new sample
         loaded_labels = []
@@ -303,14 +421,34 @@ class PlanTDataset(Dataset):
         pdd_classes = set(SIGN_CODES)
         sign_like = {"stop_sign"} | pdd_classes
 
+        # H1 (sign persistence): radius for TL/sign objects, overridable per
+        # experiment (default 30m matches original behaviour).
+        sign_range = self.cfg_train.get("sign_range_m", 30)
+
+        # H3 (sign memory): decayed "was a relevant sign seen in the last K
+        # frames" scalar, computed from raw (unmutated) labels_data before the
+        # in-place "too far" reclassification below. Off by default.
+        sign_memory_frames = int(self.cfg_train.get("sign_memory_frames", 0) or 0)
+        if sign_memory_frames > 0:
+            sample["sign_recent_signal"] = self._recent_sign_signal(
+                labels[0].decode(), labels_data, sign_like, sign_range, sign_memory_frames
+            )
+
+        # H4 (auxiliary sign-presence loss): ground truth for the presence
+        # probe added in model.py when aux_sign_presence_weight > 0.
+        if float(self.cfg_train.get("aux_sign_presence_weight", 0.0) or 0.0) > 0:
+            sample["sign_present_now"] = float(
+                self._sign_in_range(labels_data, sign_like, sign_range)
+            )
+
         # Fix static extents and drop irrelevant objects
         for x in labels_data:
             if "position" in x:
                 pos_x, pos_y, pos_z = x["position"]
 
-                # 30m radius for TL / stop / PDD sign objects
+                # sign_range radius for TL / stop / PDD sign objects
                 if x["class"] in (["traffic_light"] + list(sign_like)):
-                    if pos_x**2 + pos_y**2 > 30**2 or abs(pos_z) > 30:
+                    if pos_x**2 + pos_y**2 > sign_range**2 or abs(pos_z) > 30:
                         x["class"] = "too far"
                 # ellipse for others
                 else:
@@ -361,6 +499,12 @@ class PlanTDataset(Dataset):
                 if x["class"].lower() in self.car_types
             ]
 
+        # H1 (sign persistence): the simulator's "affects_ego" flag can flicker
+        # frame-to-frame for sign-class objects even while in range, unlike the
+        # unconditional keep used for statics. Gate-able so default behaviour
+        # (require affects_ego) is unchanged unless the experiment opts in.
+        sign_ignore_affects_ego = self.cfg_train.get("sign_ignore_affects_ego", False)
+
         # Add static cars, static objects, traffic lights, stop / PDD signs
         def _keep_staticish(x) -> bool:
             cls = x["class"].lower() if isinstance(x["class"], str) else x["class"]
@@ -373,6 +517,8 @@ class PlanTDataset(Dataset):
             if cls == "traffic_light":
                 return x.get("state") in ["Red", "Yellow"] and x.get("affects_ego")
             if cls_key in sign_like or cls in sign_like:
+                if sign_ignore_affects_ego:
+                    return True
                 return bool(x.get("affects_ego"))
             return True
 
@@ -468,7 +614,19 @@ class PlanTDataset(Dataset):
     def aug_sample(self, sample):
         # Geometric augment using recorded augmentation_translation / rotation.
         # Translation applied first (transfuser convention).
-        translate = - np.array([0.0, sample["augmentation_translation"]])
+        #
+        # The two groups of fields live in MIRRORED lateral frames in this dump:
+        # object boxes (`input` / `output`) are y=RIGHT (plant2_frames._ego_xy
+        # negates what MetaDrive's convert_to_local_coordinates returns), while
+        # route / route_original / waypoints are y=LEFT. Applying one signed
+        # shift and one rotation to all of them -- correct upstream, where every
+        # field shares a frame -- moves the objects and the route in OPPOSITE
+        # physical directions, i.e. it teaches the wrong geometry. Mirroring a
+        # frame negates both the lateral shift and the rotation sense, so the
+        # y=right group takes +translation and R, the y=left group -translation
+        # and R.T.
+        translate_left = - np.array([0.0, sample["augmentation_translation"]])
+        translate_right = - translate_left
         rot = np.deg2rad(sample["augmentation_rotation"])
 
         if self.cfg_train.get("input_bev", False):
@@ -486,29 +644,29 @@ class PlanTDataset(Dataset):
 
         # Translation
         if len(input) > 0:
-            input[:, 1:3] += translate
+            input[:, 1:3] += translate_right
         if len(output) > 0:
-            output[:, :2] += translate
-        waypoints += translate
-        route += translate
-        route_original += translate
+            output[:, :2] += translate_right
+        waypoints += translate_left
+        route += translate_left
+        route_original += translate_left
 
         # Rotation
         c, s = np.cos(rot), np.sin(rot)
         R = np.array([[c, -s], [s, c]])
 
         if len(input) > 0:
-            input[:, 1:3] = (R.T @ input[:, 1:3].T).T
+            input[:, 1:3] = (R @ input[:, 1:3].T).T
         if len(output) > 0:
-            output[:, :2] = (R.T @ output[:, :2].T).T
+            output[:, :2] = (R @ output[:, :2].T).T
         waypoints = (R.T @ waypoints.T).T
         route = (R.T @ route.T).T
         route_original = (R.T @ route_original.T).T
 
         if len(input) > 0:
-            input[:, 3] -= np.rad2deg(rot)
+            input[:, 3] += np.rad2deg(rot)
         if len(output) > 0:
-            output[:, 2] -= np.rad2deg(rot)
+            output[:, 2] += np.rad2deg(rot)
 
         sample["input"] = input.tolist()
         if "output" in sample:

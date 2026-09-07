@@ -1,2 +1,6 @@
 *__pycache__*
 *.ckpt
+# training outputs (checkpoints are already ignored via *.ckpt)
+PlanT/log/
+PlanT/outputs/
+PlanT/wandb/

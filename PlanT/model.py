@@ -11,7 +11,7 @@ from transformers import (
 
 import timm
 
-from plant_variables import PlanTVariables
+from plant_variables import PDD_OBJECT_CLASS_START, PlanTVariables
 from util.sign_id import SIGN_CODES
 
 logger = logging.getLogger(__name__)
@@ -102,11 +102,50 @@ class HFLM(nn.Module):
 
         self.route_emb = nn.Linear(20*2, self.n_embd)
 
+        # H6/H7-detour: break the "copy route_original into pred_path" shortcut.
+        # 0.0 = disabled (exact prior behaviour).
+        self.route_dropout_p = float(
+            self.config_all.model.training.get("route_dropout_p", 0.0)
+        )
+        self.route_lateral_noise_m = float(
+            self.config_all.model.training.get("route_lateral_noise_m", 0.0)
+        )
+
         self.speed_emb = nn.Embedding(4, self.n_embd)
 
         self.input_ego_speed = self.config_all.model.training.get("input_ego_speed", False)
         if self.input_ego_speed:
             self.ego_speed_emb = nn.Linear(1, self.n_embd)
+
+        # H3 (sign memory): decayed "sign seen in the last K frames" scalar,
+        # see dataset.py PlanTDataset._recent_sign_signal / sign_memory_frames.
+        self.input_sign_memory = int(self.config_all.model.training.get("sign_memory_frames", 0) or 0) > 0
+        if self.input_sign_memory:
+            self.sign_memory_emb = nn.Linear(1, self.n_embd)
+
+        # H4 (auxiliary sign-presence loss): small probe off the same trailing
+        # token the ego-speed head reads, trained (via lit_module) to predict
+        # whether a relevant sign is present in x_objs this frame — sharpens
+        # how strongly the shared class_emb representation drives that token.
+        # Not part of forward()'s public return (would require updating every
+        # caller that unpacks pred_plan, incl. the inference adapter); stashed
+        # on self._last_aux_sign_logit instead, read by lit_module.py.
+        self.aux_sign_presence = float(
+            self.config_all.model.training.get("aux_sign_presence_weight", 0.0) or 0.0
+        ) > 0
+        if self.aux_sign_presence:
+            self.sign_presence_head = nn.Linear(self.n_embd, 1)
+        self._last_aux_sign_logit = None
+
+        # H5 (dedicated sign-pool token): pool the *current frame's* sign-like
+        # object embeddings (class_emb(4)="stop_sign" or class_emb(id)>=
+        # PDD_OBJECT_CLASS_START) into one extra global token, prepended like
+        # route_tok/speed_tok — perception-derived (from x_objs each forward
+        # pass), not an injected route-level label like the old removed
+        # sign_emb. A learned placeholder stands in when no sign is present.
+        self.sign_pool_token = bool(self.config_all.model.training.get("sign_pool_token", False))
+        if self.sign_pool_token:
+            self.sign_pool_no_sign_emb = nn.Parameter(torch.randn(self.n_embd) * 0.02)
 
         # # decoder head forecasting
         self.heads = nn.ModuleList(
@@ -221,10 +260,49 @@ class HFLM(nn.Module):
         return optimizer
 
 
+    def _perturb_route(self, route_batch):
+        """H6/H7-detour: perturb the route input during TRAINING only.
+
+        ``route_original`` (the SUMO-planned route) is fed to the model as the
+        first token, but for 4.2.x detour scenes that route runs straight
+        *through* the obstacle while the ground-truth path swerves around it.
+        Copying the route into ``pred_path`` therefore scores near-optimal loss
+        on ~96% of frames, which is exactly what the model learned to do
+        (measured predicted lateral ~0.04m == "follow the route exactly", vs
+        the ~2-3m the label needs at the obstacle). Loss reweighting can't fix
+        a shortcut that is genuinely near-optimal on the training objective;
+        removing the shortcut's reliability can.
+
+        - ``route_dropout_p``: per-sample probability of zeroing the whole
+          route input, forcing the path to be derived from perception.
+        - ``route_lateral_noise_m``: per-sample Gaussian lateral offset (std,
+          meters) applied to the route, making it an unreliable guide that
+          perception must correct.
+
+        Not applied under ``eval()`` so validation loss stays comparable to
+        the other runs, and inference is untouched.
+        """
+        if not self.training:
+            return route_batch
+        if self.route_dropout_p > 0.0:
+            keep = torch.rand(
+                route_batch.shape[0], device=route_batch.device
+            ) >= self.route_dropout_p
+            route_batch = route_batch * keep[:, None, None].to(route_batch.dtype)
+        if self.route_lateral_noise_m > 0.0:
+            offset = torch.randn(
+                route_batch.shape[0],
+                device=route_batch.device,
+                dtype=route_batch.dtype,
+            ) * self.route_lateral_noise_m
+            route_batch = route_batch.clone()
+            route_batch[..., 1] = route_batch[..., 1] + offset[:, None]
+        return route_batch
+
     def forward(self, batch):
         batch_idxs = batch["idxs"]
         x_batch_objs = batch["x_objs"]
-        route_batch = batch["route_original"]
+        route_batch = self._perturb_route(batch["route_original"])
         speed_limit_batch = batch["speed_limit"]
         # Embed class_id via shared nn.Embedding; continuous attrs via Linear.
         # Supports 2-D pool (pool, 7) or batched 3-D (B, pool, 7).
@@ -237,13 +315,28 @@ class HFLM(nn.Module):
         # 3-D pool  (B, pool, n_embd)   → per-row fancy index           gives (B, maxseq, n_embd)
         if embedding.dim() == 2:
             embedding = embedding[batch_idxs]
+            class_ids_batched = class_ids[batch_idxs]
         else:
             row = torch.arange(embedding.shape[0], device=embedding.device).unsqueeze(1)
             embedding = embedding[row, batch_idxs]
+            class_ids_batched = class_ids[row, batch_idxs]
+
+        # H5: masked mean-pool sign-like object tokens (padding's class_id=0
+        # never matches) into one extra token; learned placeholder if none.
+        if self.sign_pool_token:
+            is_sign = (class_ids_batched == 4) | (class_ids_batched >= PDD_OBJECT_CLASS_START)
+            has_sign = is_sign.any(dim=1)
+            sign_mask = is_sign.unsqueeze(-1).to(embedding.dtype)
+            pooled = (embedding * sign_mask).sum(dim=1) / sign_mask.sum(dim=1).clamp(min=1.0)
+            no_sign = self.sign_pool_no_sign_emb.unsqueeze(0).expand(pooled.shape[0], -1)
+            sign_pool_tok = torch.where(has_sign.unsqueeze(-1), pooled, no_sign)[:, None]
 
         # Add axis in second dim (B x 1 x 512)
         route_tok = self.route_emb(route_batch.flatten(1))[:, None]
         embedding = torch.cat((route_tok, embedding), dim=1) # Add route to front
+
+        if self.sign_pool_token:
+            embedding = torch.cat((sign_pool_tok, embedding), dim=1)
 
         # Add speed
         speed_tok = self.speed_emb(speed_limit_batch)[:, None]
@@ -251,12 +344,21 @@ class HFLM(nn.Module):
 
         # How many tokens at the front before objects
         remove_idxs = 2
+        if self.sign_pool_token:
+            remove_idxs += 1
 
         # Add ego_speed:
         if self.input_ego_speed:
             ego_speed_tok = self.ego_speed_emb(batch["input_ego_speed"][:, None]) # Linear input needs to be (10, 1)
             ego_speed_tok = ego_speed_tok[:, None] # Add dim for cat
             embedding = torch.cat((ego_speed_tok, embedding), dim=1)
+            remove_idxs += 1
+
+        # H3: recent-sign-presence scalar (see dataset.py sign_memory_frames)
+        if self.input_sign_memory:
+            sign_mem_tok = self.sign_memory_emb(batch["sign_recent_signal"][:, None])
+            sign_mem_tok = sign_mem_tok[:, None]
+            embedding = torch.cat((sign_mem_tok, embedding), dim=1)
             remove_idxs += 1
 
         if self.input_bev:
@@ -325,6 +427,12 @@ class HFLM(nn.Module):
         # dedicated ego speed head (always anchored on the first wp token).
         if pred_speed is None:
             pred_speed = self.ego_speed_classifier(x[:, -1, :])
+
+        # H4: auxiliary sign-presence probe off the same trailing token.
+        if self.aux_sign_presence:
+            self._last_aux_sign_logit = self.sign_presence_head(x[:, -1, :]).squeeze(-1)
+        else:
+            self._last_aux_sign_logit = None
 
         pred_plan = (pred_path, pred_wps, pred_speed)
 

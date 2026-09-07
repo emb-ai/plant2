@@ -105,7 +105,7 @@ class LitHFLM(pl.LightningModule):
             losses["loss_wp"] = F.l1_loss(pred_wps, waypoints_batch)
 
         if pred_path is not None:
-            losses["loss_path"] = F.l1_loss(pred_path, path_batch)
+            losses["loss_path"] = self._path_loss(pred_path, path_batch)
 
         if pred_speed is not None:
             target_speeds = torch.tensor(self.plant_variables.target_speeds, device=targetspeed_batch.device)
@@ -138,6 +138,10 @@ class LitHFLM(pl.LightningModule):
                 losses_forecast.append(logits[i].new_zeros(()))
         losses["loss_forecast"] = torch.mean(torch.stack(losses_forecast))
 
+        aux_loss = self._aux_sign_presence_loss(batch)
+        if aux_loss is not None:
+            losses["loss_sign_presence"] = aux_loss
+
         for name, loss in losses.items():
             self.log(
                 f"train/{name}",
@@ -150,10 +154,11 @@ class LitHFLM(pl.LightningModule):
             )
 
         weights = {
-            "loss_wp": self.cfg.model.waypoints.get("wp_weight", 1), 
+            "loss_wp": self.cfg.model.waypoints.get("wp_weight", 1),
             "loss_forecast": self.cfg.model.pre_training.get("forecastLoss_weight", 0),
             "loss_path": self.cfg.model.waypoints.get("path_weight", 1),
             "loss_egospeed": self.cfg.model.waypoints.get("speed_weight", 1),
+            "loss_sign_presence": self.cfg.model.training.get("aux_sign_presence_weight", 0.0),
         }
 
         loss_all = sum([loss*weights[name] for name, loss in losses.items()])
@@ -215,7 +220,7 @@ class LitHFLM(pl.LightningModule):
         if pred_wps is not None:
             losses["loss_wp"] = F.l1_loss(pred_wps, waypoints_batch)
         if pred_path is not None:
-            losses["loss_path"] = F.l1_loss(pred_path, path_batch)
+            losses["loss_path"] = self._path_loss(pred_path, path_batch)
         if pred_speed is not None:
             target_speeds = torch.tensor(
                 self.plant_variables.target_speeds, device=targetspeed_batch.device
@@ -249,11 +254,16 @@ class LitHFLM(pl.LightningModule):
                 losses_forecast.append(logits[i].new_zeros(()))
         losses["loss_forecast"] = torch.mean(torch.stack(losses_forecast))
 
+        aux_loss = self._aux_sign_presence_loss(batch)
+        if aux_loss is not None:
+            losses["loss_sign_presence"] = aux_loss
+
         weights = {
             "loss_wp": self.cfg.model.waypoints.get("wp_weight", 1),
             "loss_forecast": self.cfg.model.pre_training.get("forecastLoss_weight", 0),
             "loss_path": self.cfg.model.waypoints.get("path_weight", 1),
             "loss_egospeed": self.cfg.model.waypoints.get("speed_weight", 1),
+            "loss_sign_presence": self.cfg.model.training.get("aux_sign_presence_weight", 0.0),
         }
         loss_all = sum(loss * weights[name] for name, loss in losses.items())
 
@@ -282,6 +292,37 @@ class LitHFLM(pl.LightningModule):
         torch.nn.utils.clip_grad_norm_(
             self.model.parameters(), self.cfg_train.grad_norm_clip
         )
+
+    def _path_loss(self, pred_path, path_batch):
+        """L1 path loss, optionally up-weighted per-sample by how much lateral
+        deviation the ground-truth path itself requires (H2-detour: obstacle
+        avoidance is a handful of frames per route with a real 2-3m swerve,
+        drowned out by the ~96% of frames that are near-straight -- a uniform
+        global path_weight scales both equally and can't fix that imbalance).
+
+        ``model.waypoints.lateral_reweight_alpha`` (default 0 = disabled,
+        exact prior behaviour): per-sample weight is
+        ``1 + alpha * max(|path_y|)`` over the sample's path points, so a
+        route-segment with no lateral need keeps weight 1 and a segment
+        needing e.g. 3m of swerve gets ``1 + 3*alpha``.
+        """
+        alpha = float(self.cfg.model.waypoints.get("lateral_reweight_alpha", 0.0))
+        if alpha <= 0.0:
+            return F.l1_loss(pred_path, path_batch)
+        per_elem = F.l1_loss(pred_path, path_batch, reduction="none")  # (B, path_len, 2)
+        per_sample = per_elem.mean(dim=tuple(range(1, per_elem.dim())))  # (B,)
+        lateral_dev = path_batch[..., 1].abs().amax(dim=-1)  # (B,) max |y| over path points
+        sample_w = 1.0 + alpha * lateral_dev
+        return (per_sample * sample_w).sum() / sample_w.sum()
+
+    def _aux_sign_presence_loss(self, batch):
+        """H4: BCE for the auxiliary sign-presence probe (see model.py
+        aux_sign_presence / dataset.py sign_present_now). None when disabled."""
+        logit = getattr(self.model, "_last_aux_sign_logit", None)
+        if logit is None or "sign_present_now" not in batch:
+            return None
+        target = batch["sign_present_now"].reshape(-1).to(dtype=logit.dtype)
+        return F.binary_cross_entropy_with_logits(logit, target)
 
     def _stop_speed_loss_weight(self) -> float:
         """Per-sample multiplier for stop targets (target_speed≈0).
