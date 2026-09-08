@@ -50,6 +50,11 @@ _ADDED_SIGN_CODES: tuple[str, ...] = (
     "4.1.4",
     "4.1.5",
     "4.1.6",
+    # Reserved lane / reserved road (5.14.1-2, 5.11.1-2).
+    "5.11.1",
+    "5.11.2",
+    "5.14.1",
+    "5.14.2",
 )
 
 # Box-token classes: appending here is safe because class_nums enumerates this
