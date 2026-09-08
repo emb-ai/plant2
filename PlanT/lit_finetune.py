@@ -172,7 +172,20 @@ def main(cfg):
         num_workers=n_workers,
     )
     if n_workers > 0:
-        loader_kw["multiprocessing_context"] = torch.multiprocessing.get_context("spawn")
+        # spawn re-imports the main module in every worker (torch, transformers,
+        # the simulator: ~18 s each) while the parent blocks in Process.start()
+        # until the child reads its pickle, so 24 workers came up one after the
+        # other over seven minutes. forkserver imports once, in the server, and
+        # forks the workers from it; the server itself is a fresh process, so
+        # no CUDA context is inherited. LOADER_MP_CONTEXT keeps spawn available.
+        ctx_name = os.environ.get("LOADER_MP_CONTEXT", "forkserver")
+        mp_ctx = torch.multiprocessing.get_context(ctx_name)
+        if ctx_name == "forkserver":
+            # __main__ must stay in the list: the launcher shim imports
+            # transformers at module level, and without the preload every
+            # forked worker re-runs it (~15 s each) before reading its pickle.
+            mp_ctx.set_forkserver_preload(["__main__", "torch", "numpy", "dataset"])
+        loader_kw["multiprocessing_context"] = mp_ctx
         loader_kw["persistent_workers"] = True
         loader_kw["prefetch_factor"] = 2
 

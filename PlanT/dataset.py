@@ -10,6 +10,9 @@ from torch.utils.data import Dataset
 from PIL import Image
 from torchvision.transforms.functional import pil_to_tensor
 
+import functools
+import mmap
+import io
 import gzip
 import glob
 
@@ -17,6 +20,7 @@ from plant_variables import PlanTVariables
 from util.static_extents import CAR_EXTENTS, STATIC_EXTENTS
 from util.sign_id import (
     MIN_SPEED_CODES,
+    SIGN_ID_VOCAB,
     base_sign_code,
     SIGN_VALUE_CODES,
     sign_of_route_name,
@@ -42,6 +46,81 @@ def normalize_angle_degree(x):
 
 def rad2deg(theta):
     return normalize_angle_degree(np.rad2deg(theta).item())
+
+
+# The future window makes one sample read seq_len + future_frames measurement
+# files (41 with the 40-frame path target). On a network share at ~6 ms per file
+# that is ~250 ms per sample and the loader starves the GPU. A route dumped with
+# ``measurements_all.json.gz`` (frame stem -> measurement dict, written by
+# scripts/plant2_ft_pipeline/data/consolidate_measurements.py) is read once per
+# worker and kept in a small LRU; routes without it fall back to the per-file
+# reads, so the two layouts can be mixed.
+DETOUR_CODES = ("4.2.1", "4.2.2", "4.2.3")
+
+_MEAS_ALL_NAME = "measurements_all.json.gz"
+
+# A route packed by scripts/plant2_ft_pipeline/data/pack_routes.py carries all
+# of its frame files in one pack.bin with a pack.json index. Reading a frame
+# then is a slice of a memory-mapped file the page cache keeps in RAM, shared
+# by every worker on the node, instead of a small read on the network share.
+# Routes without a pack fall back to the plain files.
+_PACK_BIN, _PACK_IDX = "pack.bin", "pack.json"
+
+
+@functools.lru_cache(maxsize=4096)
+def _route_pack(route_dir: str):
+    idx = os.path.join(route_dir, _PACK_IDX)
+    if not os.path.isfile(idx):
+        return None
+    with open(idx, "r", encoding="utf-8") as fh:
+        index = json.load(fh)
+    fh = open(os.path.join(route_dir, _PACK_BIN), "rb")
+    view = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+    return view, index
+
+
+def _read_frame_bytes(path) -> bytes:
+    """Bytes of ``<route>/<sub>/<name>``, from the route pack when there is one."""
+    path = os.fsdecode(path)
+    sub_dir, name = os.path.split(path)
+    route_dir, sub = os.path.split(sub_dir)
+    pack = _route_pack(route_dir)
+    if pack is not None:
+        entry = pack[1].get(f"{sub}/{name}")
+        if entry is not None:
+            off, length = entry
+            return pack[0][off:off + length]
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _load_gz_json(path):
+    return json.loads(gzip.decompress(_read_frame_bytes(path)))
+
+
+def _open_image(path):
+    return Image.open(io.BytesIO(_read_frame_bytes(path)))
+
+
+@functools.lru_cache(maxsize=48)
+def _route_measurements(path: str) -> dict:
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _load_measurement_window(measurements, n_meas: int) -> list:
+    first = os.fsdecode(measurements[0])
+    route_dir = os.path.dirname(os.path.dirname(first))
+    if _route_pack(route_dir) is not None:
+        return [_load_gz_json(measurements[i]) for i in range(n_meas)]
+    consolidated = os.path.join(route_dir, _MEAS_ALL_NAME)
+    if os.path.isfile(consolidated):
+        table = _route_measurements(consolidated)
+        stems = [os.path.basename(os.fsdecode(m)).split(".")[0] for m in measurements[:n_meas]]
+        if all(stem in table for stem in stems):
+            return [table[stem] for stem in stems]
+    return [_load_gz_json(measurements[i]) for i in range(n_meas)]
+
 
 class PlanTDataset(Dataset):
     @beartype
@@ -76,6 +155,12 @@ class PlanTDataset(Dataset):
         # geometry and traffic in the frame.
         self.ts_lookahead = str(os.environ.get(
             "TS_LOOKAHEAD", self.cfg_train.get("ts_lookahead", 0)) or 0) not in ("0", "", "False", "false")
+        # Floor plates (4.6): label the in-zone target speed no lower than the
+        # floor plus this margin. Rule experts that pass the oracle filter may
+        # ride the floor itself (a 4.6 violation needs 10 sustained steps under
+        # it), and a policy imitating that with the usual noise dips below.
+        # 0 keeps the expert's speed as it is.
+        self.min_speed_margin_kmh = float(os.environ.get("MIN_SPEED_MARGIN_KMH", 0) or 0)
         if self.ts_lookahead:
             print("[PlanTDataset] target_speed = min ego speed over the "
                   f"{self.cfg.model.waypoints.wps_len * self.wps_stride}-frame lookahead window")
@@ -222,20 +307,16 @@ class PlanTDataset(Dataset):
                 5,
                 num_seq - self.future_frames - self.cfg_train.seq_len - 2,
             ):
-                # load input seq and pred seq jointly
-                label = []
-                measurement = []
-                for idx in range(self.cfg_train.seq_len + self.future_frames):
-                    labels_file = route_dir / "boxes" / f"{seq + idx:04d}.json.gz"
-                    measurements_file = (
-                        route_dir / "measurements" / f"{seq + idx:04d}.json.gz"
-                    )
-                    label.append(labels_file)
-                    measurement.append(measurements_file)
-
+                # Only the first frame of the window is stored; the rest are
+                # consecutive frame numbers and are expanded in __getitem__.
+                # Storing all seq_len + future_frames paths per sample (41 with
+                # the future path target) made the dataset object gigabytes,
+                # and every spawned loader worker received a pickled copy of
+                # it through a pipe: 16 workers took over ten minutes to come
+                # up, one after the other, before the first batch.
                 self.BEV.append(route_dir / "bev_no_car_semantics" / f"{seq + self.cfg_train.seq_len-1:04d}.png")
-                self.labels.append(label)
-                self.measurements.append(measurement)
+                self.labels.append(route_dir / "boxes" / f"{seq:04d}.json.gz")
+                self.measurements.append(route_dir / "measurements" / f"{seq:04d}.json.gz")
 
         # There is a complex "memory leak"/performance issue when using Python objects like lists in a Dataloader that is loaded with multiprocessing, num_workers > 0
         # A summary of that ongoing discussion can be found here https://github.com/pytorch/pytorch/issues/13246#issuecomment-905703662
@@ -243,6 +324,7 @@ class PlanTDataset(Dataset):
         self.BEV          = np.array(self.BEV         ).astype(np.bytes_)
         self.labels       = np.array(self.labels      ).astype(np.bytes_)
         self.measurements = np.array(self.measurements).astype(np.bytes_)
+        self.window = self.cfg_train.seq_len + self.future_frames
 
         # Route → PDD sign_id (embedding index). Resolved once at init; attached
         # on every __getitem__ without writing into diskcache.
@@ -294,7 +376,7 @@ class PlanTDataset(Dataset):
             return 0, "none"
 
         for lab in self.labels:
-            label_path = lab[0].decode()
+            label_path = lab.decode()
             route_name = route_name_from_label_path(label_path)
             route_dir = str(Path(label_path).parent.parent)
             if route_dir not in route_cache:
@@ -357,7 +439,7 @@ class PlanTDataset(Dataset):
 
         n_hot = n_zone = n_cones = 0
         for i, lab in enumerate(self.labels):
-            label_path = Path(lab[0].decode())
+            label_path = Path(lab.decode())
             route = label_path.parent.parent.name
             entry = info.get(route)
             if entry is None:
@@ -394,6 +476,13 @@ class PlanTDataset(Dataset):
         return out
 
 
+    def _window_paths(self, first) -> list:
+        """The seq_len + future_frames consecutive frame paths starting at ``first``."""
+        first = os.fsdecode(first)
+        head, name = os.path.split(first)
+        seq = int(name.split(".")[0])
+        return [os.fsencode(os.path.join(head, f"{seq + i:04d}.json.gz")) for i in range(self.window)]
+
     def _cache_key(self, labels) -> str:
         """Cache key. The stride changes the waypoints stored in a sample and
         the lookahead mode changes target_speed, so both must be part of the
@@ -404,9 +493,35 @@ class PlanTDataset(Dataset):
             key = f"{key}|s{self.wps_stride}"
         if self.ts_lookahead:
             key = f"{key}|la"
+        if self.min_speed_margin_kmh > 0.0:
+            key = f"{key}|m{self.min_speed_margin_kmh:g}"
         if self.path_target != "route":
             key = f"{key}|pf{self.path_horizon}"
         return key
+
+    def _floor_kmh(self, boxes, index):
+        """Plate value of a floor sign the ego has passed (box behind the ego),
+        from the box itself or from the route-level qualified sign id; None
+        when the ego is not in the zone or the value is unknown."""
+        for b in boxes:
+            if str(b.get("class")) not in MIN_SPEED_CODES:
+                continue
+            try:
+                behind = float(b.get("position", [0.0])[0]) < 0.0
+            except (TypeError, ValueError, IndexError):
+                behind = False
+            if not behind:
+                continue
+            val = b.get("sign_value_kmh")
+            if val is None:
+                sid = int(self.sample_sign_ids[index])
+                if 0 < sid <= len(SIGN_ID_VOCAB) and "@" in SIGN_ID_VOCAB[sid - 1]:
+                    val = SIGN_ID_VOCAB[sid - 1].split("@", 1)[1]
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+        return None
 
     def _future_path(self, loaded_measurements):
         """The ego's realised future in the current ego frame, arc-length
@@ -453,8 +568,8 @@ class PlanTDataset(Dataset):
     def __getitem__(self, index):
         """Returns the item at index idx."""
 
-        labels = self.labels[index]
-        measurements = self.measurements[index]
+        labels = self._window_paths(self.labels[index])
+        measurements = self._window_paths(self.measurements[index])
 
         sample = {
             "input": []
@@ -492,10 +607,9 @@ class PlanTDataset(Dataset):
         # forecasting offset (+1), so loading the rest is pure I/O.
         n_meas = min(len(measurements), self.cfg_train.seq_len + self.future_frames)
         n_lab = min(len(labels), self.cfg_train.seq_len + 1)
-        for i in range(n_meas):
-            loaded_measurements.append(json.load(gzip.open(measurements[i])))
+        loaded_measurements = _load_measurement_window(measurements, n_meas)
         for i in range(n_lab):
-            loaded_labels.append(json.load(gzip.open(labels[i])))
+            loaded_labels.append(_load_gz_json(labels[i]))
 
         # Extract ego waypoints
         matrices = [x["ego_matrix"] for x in loaded_measurements[self.cfg_train.seq_len - 1 :]]
@@ -544,7 +658,18 @@ class PlanTDataset(Dataset):
             # worse total. The expert's own speed already satisfies the floor
             # (measured: 0 violating steps in 4405 in-zone frames under the sign's
             # real rule), so imitating it needs no margin in either direction.
-            v = speeds[0] if code in MIN_SPEED_CODES else min(speeds)
+            # A detour is driven around cones with continual small brakings,
+            # so the window minimum sits well under the expert's speed on every
+            # frame: models trained with it crawled the detours at 12-14 km/h
+            # against 20-23 km/h for the experts they imitated (v6 test), while
+            # the plate-label ablation, whose detour label is the plain speed,
+            # drove them at 40 km/h. The side of the manoeuvre is in the path
+            # target, not in the speed label, so detours take the plain speed.
+            v = speeds[0] if (code in MIN_SPEED_CODES or code in DETOUR_CODES) else min(speeds)
+            if code in MIN_SPEED_CODES and self.min_speed_margin_kmh > 0.0:
+                floor = self._floor_kmh(loaded_labels[self.cfg_train.seq_len - 1], index)
+                if floor is not None:
+                    v = max(v, (floor + self.min_speed_margin_kmh) / 3.6)
             sample["target_speed"] = 0.0 if v < 0.5 else v
 
         speed_limit = loaded_measurements[self.cfg_train.seq_len - 1]["speed_limit"]
@@ -559,7 +684,7 @@ class PlanTDataset(Dataset):
             sample["target_speed"] = 0.0
 
         if self.cfg_train.get("input_bev", False):
-            bev = Image.open(self.BEV[index].decode())
+            bev = _open_image(self.BEV[index].decode())
             bev = pil_to_tensor(bev)
             bev = torch.rot90(bev, dims=(1, 2))
             sample["BEV"] = self.bev_colors[bev[0, 64:-64, 64:-64].to(torch.int)].permute(2, 0, 1)
