@@ -94,9 +94,28 @@ SIGN_ID_VOCAB: tuple[str, ...] = (
     + _ADDED_SIGN_CODES
 )
 
+
+# The three 2.3 variants say the same thing to the ego -- a secondary road
+# joins, you keep priority -- and differ only in which side it joins on, which
+# the plate's own position already carries. The benchmark labels the family
+# "2.3", a code with no id of its own, so the variants are folded onto one.
+# 2.3.1's slot is reused rather than a new entry appended: SIGN_ID_VOCAB's
+# order is load-bearing, and reusing a slot moves nothing.
+SIGN_CODE_ALIASES: dict[str, str] = {"2.3.1": "2.3", "2.3.2": "2.3", "2.3.3": "2.3"}
+
+
+def canonical_sign_code(code):
+    """Fold a variant onto the code its family is scored under."""
+    if not code:
+        return code
+    return SIGN_CODE_ALIASES.get(str(code).strip(), code)
+
 # 0 = unknown; 1..N = SIGN_ID_VOCAB
 SIGN_CATS: dict[str, int] = {code: i + 1 for i, code in enumerate(SIGN_ID_VOCAB)}
 NUM_SIGN_CLASSES: int = 1 + len(SIGN_ID_VOCAB)
+SIGN_CATS["2.3"] = SIGN_CATS["2.3.1"]
+for _variant in SIGN_CODE_ALIASES:
+    SIGN_CATS[_variant] = SIGN_CATS["2.3"]
 
 # Plates that prescribe a floor rather than a ceiling: the driver must stay
 # ABOVE the number. Every other speed plate is a ceiling, and the two demand
@@ -112,7 +131,7 @@ def base_sign_code(sign_id: int) -> Optional[str]:
         return None
     if idx <= 0 or idx > len(SIGN_ID_VOCAB):
         return None
-    return SIGN_ID_VOCAB[idx - 1].split("@", 1)[0]
+    return canonical_sign_code(SIGN_ID_VOCAB[idx - 1].split("@", 1)[0])
 
 
 _SUMO_SIGN_RE = re.compile(
@@ -130,6 +149,7 @@ def sign_code_to_id(code: Optional[str], value_kmh=None) -> int:
     """
     if not code:
         return 0
+    code = canonical_sign_code(code)
     q = qualified_sign_code(code, value_kmh)
     return SIGN_CATS.get(q, SIGN_CATS.get(str(code).strip(), 0))
 

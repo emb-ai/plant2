@@ -1,4 +1,4 @@
-from util.sign_id import SIGN_CODES
+from util.sign_id import SIGN_CODES, SIGN_CODE_ALIASES
 
 # tok_emb index for the first PDD object class (after emergency=6).
 PDD_OBJECT_CLASS_START = 7
@@ -29,8 +29,16 @@ class PlanTVariables:
                     },
                  }
 
+    # The 2.3 variants share one box token for the same reason they share one
+    # sign id: the side is in the plate's position, not in its class.
+    _v23 = class_nums["2.3.1"]
+    for _variant in SIGN_CODE_ALIASES:
+        class_nums[_variant] = _v23
+    class_nums["2.3"] = _v23
+    del _v23, _variant
+
     # Classes written into boxes that are spatial PDD signs (not the global sign_emb).
-    pdd_object_classes = frozenset(SIGN_CODES)
+    pdd_object_classes = frozenset(SIGN_CODES) | {"2.3"}
     
     car_types = ["car", "walker","emergency"]
 
