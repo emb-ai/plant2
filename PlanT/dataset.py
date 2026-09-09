@@ -962,9 +962,31 @@ class PlanTDataset(Dataset):
         return self._attach_sign_id(sample, index)
 
     def aug_sample(self, sample):
-        # Geometric augment using recorded augmentation_translation / rotation.
-        # Translation applied first (transfuser convention).
-        translate = - np.array([0.0, sample["augmentation_translation"]])
+        # Geometric augment using recorded augmentation_translation / rotation:
+        # re-express one recorded frame as if the ego had sat
+        # `augmentation_translation` metres to its own LEFT and been rotated
+        # `augmentation_rotation` degrees CCW -- the same virtual pose
+        # render_bev_plant2 draws BEV_aug from.
+        #
+        # The catch is that the two groups of fields live in MIRRORED lateral
+        # frames in this dump. Object boxes (`input` / `output`) are y=RIGHT:
+        # plant2_frames.collect_boxes negates what MetaDrive's
+        # convert_to_local_coordinates returns. route / route_original /
+        # waypoints are y=LEFT (plant2_frames.get_route flips back, and
+        # build_ego_matrix is x-forward/y-left). Applying one signed shift and
+        # one rotation to all of them -- correct upstream, where every field
+        # shares a frame -- moves objects and route in OPPOSITE physical
+        # directions. Mirroring a frame negates both the lateral shift and the
+        # rotation sense, so the y=right group takes +translation and R while
+        # the y=left group takes -translation and R.T.
+        #
+        # Yaw is the exception and deliberately keeps its original sign. The
+        # dump stores yaw as wrap_to_pi(obj.heading_theta - ego_heading), i.e.
+        # CCW in the y=LEFT world, and does NOT mirror it alongside the
+        # position -- so under an ego rotation of +rot every relative heading
+        # becomes yaw - rot regardless of which frame the position is in.
+        translate_left = - np.array([0.0, sample["augmentation_translation"]])
+        translate_right = - translate_left
         rot = np.deg2rad(sample["augmentation_rotation"])
 
         if self.cfg_train.get("input_bev", False):
@@ -982,21 +1004,21 @@ class PlanTDataset(Dataset):
 
         # Translation
         if len(input) > 0:
-            input[:, 1:3] += translate
+            input[:, 1:3] += translate_right
         if len(output) > 0:
-            output[:, :2] += translate
-        waypoints += translate
-        route += translate
-        route_original += translate
+            output[:, :2] += translate_right
+        waypoints += translate_left
+        route += translate_left
+        route_original += translate_left
 
         # Rotation
         c, s = np.cos(rot), np.sin(rot)
         R = np.array([[c, -s], [s, c]])
 
         if len(input) > 0:
-            input[:, 1:3] = (R.T @ input[:, 1:3].T).T
+            input[:, 1:3] = (R @ input[:, 1:3].T).T
         if len(output) > 0:
-            output[:, :2] = (R.T @ output[:, :2].T).T
+            output[:, :2] = (R @ output[:, :2].T).T
         waypoints = (R.T @ waypoints.T).T
         route = (R.T @ route.T).T
         route_original = (R.T @ route_original.T).T
