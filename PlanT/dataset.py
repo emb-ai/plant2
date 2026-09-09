@@ -57,6 +57,11 @@ def rad2deg(theta):
 # reads, so the two layouts can be mixed.
 DETOUR_CODES = ("4.2.1", "4.2.2", "4.2.3")
 
+# Signs whose rule is "stop only while someone is crossing, then go on".
+# Their routes contain a departure from a standstill, which the window
+# minimum in the target_speed block cannot express -- see ts_resume.
+YIELD_CODES = ("5.19",)
+
 # Below this per-frame step the ego counts as standing and its last step is
 # numerical jitter, not a heading (see _future_path). 5 cm at 10 Hz is 0.5 m/s.
 MIN_EXTEND_STEP_M = 0.05
@@ -165,9 +170,31 @@ class PlanTDataset(Dataset):
         # it), and a policy imitating that with the usual noise dips below.
         # 0 keeps the expert's speed as it is.
         self.min_speed_margin_kmh = float(os.environ.get("MIN_SPEED_MARGIN_KMH", 0) or 0)
+        # How wide that lookahead really is. ``future`` below is everything the
+        # sample loaded, and PATH_TARGET=future raises that from wps_len*stride
+        # to PATH_HORIZON_FRAMES -- so the recipe's 8-frame window is silently a
+        # 40-frame one. Measured on the crosswalk dump: at 40 frames 26.0% of the
+        # frames where the ego is still moving are labelled "stop" (7.7% at 8),
+        # and the label sits 2.33 m/s under the speed the expert actually drove
+        # (0.66 m/s at 8). 0 keeps that; a positive value caps the window.
+        self.ts_window = int(os.environ.get("TS_WINDOW_FRAMES", 0) or 0)
+        # Lead, in frames, for a departure from a standstill. The minimum
+        # includes the current frame, so a standing ego is labelled exactly 0 on
+        # every frame -- including the last one before it pulls away. "Go" is
+        # not a command this label can express, and closed-loop the standstill
+        # is absorbing. Upstream dumps the *commanded* speed, which rises while
+        # the car is still at rest; this reconstructs it for YIELD_CODES by
+        # taking the window maximum over the next few frames. 0 = off.
+        self.ts_resume = int(os.environ.get("TS_RESUME_FRAMES", 0) or 0)
         if self.ts_lookahead:
             print("[PlanTDataset] target_speed = min ego speed over the "
                   f"{self.cfg.model.waypoints.wps_len * self.wps_stride}-frame lookahead window")
+            if self.ts_window > 0:
+                print(f"[PlanTDataset] target_speed lookahead capped at "
+                      f"{self.ts_window} frames ({0.1 * self.ts_window:.1f} s)")
+            if self.ts_resume > 0:
+                print(f"[PlanTDataset] a standing ego on {YIELD_CODES} is labelled "
+                      f"with the window maximum over {self.ts_resume} frames")
 
         # loss_path's target is interpolate_route(route) while the model's route
         # token is route_original, and the dump writes both from one array
@@ -659,6 +686,8 @@ class PlanTDataset(Dataset):
             # whose label is the ego speed (priority signs); do not enable for
             # posted-limit routes, where target_speed is the constant limit.
             future = loaded_measurements[self.cfg_train.seq_len - 1:]
+            if self.ts_window > 0:
+                future = future[:self.ts_window + 1]
             speeds = [float(m["ego_speed"] if "ego_speed" in m else m["speed"])
                       for m in future]
             # The minimum encodes a margin BELOW what the expert drove, which is
@@ -682,7 +711,16 @@ class PlanTDataset(Dataset):
             # the plate-label ablation, whose detour label is the plain speed,
             # drove them at 40 km/h. The side of the manoeuvre is in the path
             # target, not in the speed label, so detours take the plain speed.
-            v = speeds[0] if (code in MIN_SPEED_CODES or code in DETOUR_CODES) else min(speeds)
+            if code in MIN_SPEED_CODES or code in DETOUR_CODES:
+                v = speeds[0]
+            elif self.ts_resume > 0 and code in YIELD_CODES and speeds[0] < 0.5:
+                # Standing, so the minimum is 0 by construction. Label what the
+                # expert is about to do instead: during a long wait the whole
+                # window is still 0 and nothing changes, and only within a
+                # second of the real departure does this turn positive.
+                v = max(speeds[:self.ts_resume + 1])
+            else:
+                v = min(speeds)
             if code in MIN_SPEED_CODES and self.min_speed_margin_kmh > 0.0:
                 floor = self._floor_kmh(loaded_labels[self.cfg_train.seq_len - 1], index)
                 if floor is not None:
