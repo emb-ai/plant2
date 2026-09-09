@@ -57,6 +57,10 @@ def rad2deg(theta):
 # reads, so the two layouts can be mixed.
 DETOUR_CODES = ("4.2.1", "4.2.2", "4.2.3")
 
+# Below this per-frame step the ego counts as standing and its last step is
+# numerical jitter, not a heading (see _future_path). 5 cm at 10 Hz is 0.5 m/s.
+MIN_EXTEND_STEP_M = 0.05
+
 _MEAS_ALL_NAME = "measurements_all.json.gz"
 
 # A route packed by scripts/plant2_ft_pipeline/data/pack_routes.py carries all
@@ -544,9 +548,22 @@ class PlanTDataset(Dataset):
         if travelled < path_len + 1.0 and len(pts) > 2:
             step = pts[-1] - pts[-2]
             norm = float(np.linalg.norm(step))
-            if norm > 1e-6:
-                pts = np.vstack(
-                    [pts, pts[-1] + step / norm * (path_len + 1.0 - travelled)])
+            if norm < MIN_EXTEND_STEP_M:
+                # A standing ego -- yielding at a crosswalk, waiting in a queue --
+                # leaves only numerical jitter in its final step, and normalising
+                # that turns noise into a heading: a quarter of the crosswalk
+                # windows are stationary, and some of them produced a 21 m target
+                # pointing straight backwards. Prefer the net displacement over the
+                # window, and fall back to the ego's own forward axis, which is +x
+                # in this frame.
+                net = pts[-1] - pts[0]
+                net_norm = float(np.linalg.norm(net))
+                if net_norm >= MIN_EXTEND_STEP_M:
+                    step, norm = net, net_norm
+                else:
+                    step, norm = np.array([1.0, 0.0]), 1.0
+            pts = np.vstack(
+                [pts, pts[-1] + step / norm * (path_len + 1.0 - travelled)])
         return interpolate_route(pts[1:])
 
     def add_parked_cars(self, sample):
