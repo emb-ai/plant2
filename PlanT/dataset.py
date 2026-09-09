@@ -131,6 +131,27 @@ def _load_measurement_window(measurements, n_meas: int) -> list:
     return [_load_gz_json(measurements[i]) for i in range(n_meas)]
 
 
+def _parse_window_spec(raw):
+    """`"8"` -> (8, {}); `"default:1,3.24:8"` -> (1, {"3.24": 8})."""
+    text = str(raw or "").strip()
+    if not text:
+        return 0, {}
+    if ":" not in text:
+        return int(text), {}
+    default, by_code = 0, {}
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        key, _, value = part.partition(":")
+        key = key.strip()
+        if key in ("default", "*"):
+            default = int(value)
+        else:
+            by_code[key] = int(value)
+    return default, by_code
+
+
 class PlanTDataset(Dataset):
     @beartype
     def __init__(self, root: str, cfg, shared_dict=None) -> None:
@@ -177,7 +198,15 @@ class PlanTDataset(Dataset):
         # frames where the ego is still moving are labelled "stop" (7.7% at 8),
         # and the label sits 2.33 m/s under the speed the expert actually drove
         # (0.66 m/s at 8). 0 keeps that; a positive value caps the window.
-        self.ts_window = int(os.environ.get("TS_WINDOW_FRAMES", 0) or 0)
+        # Accepts a plain number for every code, or a per-code table
+        # ("default:1,3.24:8,5.31:8"). The table is not an extra mechanism: the
+        # speeds[0] branches below already are per-code windows of 1, written as
+        # control flow. Which window a sign wants follows from why it wants a
+        # margin at all -- a ceiling plate needs one or it rides the limit, a
+        # floor plate's margin points at the violation, a detour's is a
+        # handbrake, and a crosswalk's makes the standstill absorbing.
+        self.ts_window, self.ts_window_by_code = _parse_window_spec(
+            os.environ.get("TS_WINDOW_FRAMES", 0))
         # Lead, in frames, for a departure from a standstill. The minimum
         # includes the current frame, so a standing ego is labelled exactly 0 on
         # every frame -- including the last one before it pulls away. "Go" is
@@ -192,6 +221,10 @@ class PlanTDataset(Dataset):
             if self.ts_window > 0:
                 print(f"[PlanTDataset] target_speed lookahead capped at "
                       f"{self.ts_window} frames ({0.1 * self.ts_window:.1f} s)")
+            if self.ts_window_by_code:
+                print("[PlanTDataset] per-code lookahead: "
+                      + ", ".join(f"{c}={w}" for c, w in
+                                  sorted(self.ts_window_by_code.items())))
             if self.ts_resume > 0:
                 print(f"[PlanTDataset] a standing ego on {YIELD_CODES} is labelled "
                       f"with the window maximum over {self.ts_resume} frames")
@@ -686,8 +719,10 @@ class PlanTDataset(Dataset):
             # whose label is the ego speed (priority signs); do not enable for
             # posted-limit routes, where target_speed is the constant limit.
             future = loaded_measurements[self.cfg_train.seq_len - 1:]
-            if self.ts_window > 0:
-                future = future[:self.ts_window + 1]
+            code = base_sign_code(int(self.sample_sign_ids[index]))
+            window = self.ts_window_by_code.get(code, self.ts_window)
+            if window > 0:
+                future = future[:window + 1]
             speeds = [float(m["ego_speed"] if "ego_speed" in m else m["speed"])
                       for m in future]
             # The minimum encodes a margin BELOW what the expert drove, which is
@@ -697,7 +732,6 @@ class PlanTDataset(Dataset):
             # mirror image -- taking the minimum there points the margin at the
             # violation, and its compliance stayed at 0.231 while the ceiling
             # signs reached 0.95-1.00 on the same run.
-            code = base_sign_code(int(self.sample_sign_ids[index]))
             # The window maximum was the obvious mirror, but it raises the whole
             # speed head: with it 4.6 went 0.231 -> 0.346 while the three ceiling
             # plates fell 0.96/0.96/0.99 -> 0.85/0.72/0.89 on the same run, for a
@@ -711,7 +745,11 @@ class PlanTDataset(Dataset):
             # the plate-label ablation, whose detour label is the plain speed,
             # drove them at 40 km/h. The side of the manoeuvre is in the path
             # target, not in the speed label, so detours take the plain speed.
-            if code in MIN_SPEED_CODES or code in DETOUR_CODES:
+            if code in self.ts_window_by_code:
+                # Asked for explicitly: the table wins over the branches, which
+                # is how a code leaves the special-case list without a code edit.
+                v = min(speeds)
+            elif code in MIN_SPEED_CODES or code in DETOUR_CODES:
                 v = speeds[0]
             elif self.ts_resume > 0 and code in YIELD_CODES and speeds[0] < 0.5:
                 # Standing, so the minimum is 0 by construction. Label what the
