@@ -664,6 +664,13 @@ class PlanTDataset(Dataset):
                 future = future + extra
                 pts = _pts(future)
                 travelled = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+        if self.path_extend == "lookahead":
+            # Whatever is still short here is an expert that genuinely did not
+            # go: it stood until the episode ended. interpolate_route samples
+            # arc lengths 0..path_len and np.interp clamps past the end, so
+            # returning the short polyline holds the last observed point --
+            # "the expert stopped and stayed" -- instead of inventing travel.
+            return interpolate_route(pts[1:])
         if travelled < path_len + 1.0 and len(pts) > 2:
             step = pts[-1] - pts[-2]
             norm = float(np.linalg.norm(step))
