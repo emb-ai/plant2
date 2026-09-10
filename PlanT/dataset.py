@@ -255,10 +255,29 @@ class PlanTDataset(Dataset):
         # wps_len*stride, the realised-future path needs enough travel to fill
         # path_len metres at the 1 m spacing interpolate_route resamples to.
         self.future_frames = self.cfg.model.waypoints.wps_len * self.wps_stride
+        # How the target is completed when the ego has not covered path_len
+        # metres inside that window. "heading" extrapolates a straight line
+        # along the ego's final direction -- correct on a straight road, and
+        # wrong at a junction, where a car stopped at the line is pointing
+        # down its own lane while the route turns away. Measured on the dumps:
+        # the window covers path_len for only 25% of stop frames, so three
+        # quarters of them carry a partly synthetic target, and 22% of them
+        # get the pure forward axis because a standing ego leaves no direction
+        # to read. "lookahead" reads further ahead instead, until the expert
+        # has actually driven the distance -- the target is then entirely
+        # realised motion, including the turn.
+        self.path_extend = str(os.environ.get("PATH_EXTEND", "heading")).strip().lower()
+        if self.path_extend not in ("heading", "lookahead"):
+            raise ValueError(
+                f"PATH_EXTEND must be 'heading' or 'lookahead', got {self.path_extend!r}")
+        self.path_lookahead_max = int(os.environ.get(
+            "PATH_LOOKAHEAD_MAX_FRAMES", 200) or 200)
         if self.path_target == "future":
             self.future_frames = max(self.future_frames, self.path_horizon)
             print(f"[PlanTDataset] loss_path target = realised future over "
-                  f"{self.path_horizon} frames ({0.1 * self.path_horizon:.1f} s)")
+                  f"{self.path_horizon} frames ({0.1 * self.path_horizon:.1f} s)"
+                  + (f", extended by reading up to {self.path_lookahead_max} frames"
+                     if self.path_extend == "lookahead" else ""))
 
         # How far a PDD sign stays in the input. Must match the dump's
         # PLANT2_SIGN_RADIUS_M: the tighter of the two wins, silently.
@@ -568,6 +587,8 @@ class PlanTDataset(Dataset):
             key = f"{key}|m{self.min_speed_margin_kmh:g}"
         if self.path_target != "route":
             key = f"{key}|pf{self.path_horizon}"
+            if self.path_extend != "heading":
+                key = f"{key}|{self.path_extend}{self.path_lookahead_max}"
         return key
 
     def _floor_kmh(self, boxes, index):
@@ -594,7 +615,23 @@ class PlanTDataset(Dataset):
                 return None
         return None
 
-    def _future_path(self, loaded_measurements):
+    def _read_ahead(self, measurements, have: int, want: int) -> list:
+        """Frames ``have..want`` of the route the window came from, or as many
+        as exist. The window generator only emits ``self.window`` paths, so the
+        extra frame numbers are derived from the last one it did emit."""
+        last = os.fsdecode(measurements[have - 1])
+        head, name = os.path.split(last)
+        seq = int(name.split(".")[0])
+        out = []
+        for i in range(1, want - have + 1):
+            p = os.path.join(head, f"{seq + i:04d}.json.gz")
+            try:
+                out.append(_load_gz_json(os.fsencode(p)))
+            except Exception:
+                break  # end of the route
+        return out
+
+    def _future_path(self, loaded_measurements, measurements=None):
         """The ego's realised future in the current ego frame, arc-length
         resampled the same way the route target is, so pred_path keeps its
         geometric meaning while no longer being a copy of its own input token.
@@ -607,11 +644,26 @@ class PlanTDataset(Dataset):
         target onto one point and teach the head to plan a stop.
         """
         i0 = self.cfg_train.seq_len - 1
-        mats = np.asarray([m["ego_matrix"] for m in loaded_measurements[i0:]],
-                          dtype=np.float64)
-        pts = (np.linalg.inv(mats[0]) @ mats[:, :, 3].T).T[:, :2]
+        future = loaded_measurements[i0:]
         path_len = int(self.cfg.model.waypoints.path_len)
+
+        def _pts(ms):
+            mats = np.asarray([m["ego_matrix"] for m in ms], dtype=np.float64)
+            return (np.linalg.inv(mats[0]) @ mats[:, :, 3].T).T[:, :2]
+
+        pts = _pts(future)
         travelled = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+        if (self.path_extend == "lookahead" and travelled < path_len + 1.0
+                and measurements is not None):
+            # Read on until the expert has actually covered the distance. Only
+            # the first path_len metres survive interpolate_route, so frames
+            # past that point cost nothing and change nothing.
+            extra = self._read_ahead(measurements, len(loaded_measurements),
+                                     len(loaded_measurements) + self.path_lookahead_max)
+            if extra:
+                future = future + extra
+                pts = _pts(future)
+                travelled = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
         if travelled < path_len + 1.0 and len(pts) > 2:
             step = pts[-1] - pts[-2]
             norm = float(np.linalg.norm(step))
@@ -705,7 +757,7 @@ class PlanTDataset(Dataset):
 
         sample["route_original"] = loaded_measurements[self.cfg_train.seq_len - 1]["route_original"][:20]
         if self.path_target == "future":
-            sample["route"] = self._future_path(loaded_measurements)
+            sample["route"] = self._future_path(loaded_measurements, measurements)
         else:
             sample["route"] = interpolate_route(
                 loaded_measurements[self.cfg_train.seq_len - 1]["route"][:20])
